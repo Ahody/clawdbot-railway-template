@@ -238,7 +238,9 @@ async function ensureGatewayRunning() {
       try {
         lastGatewayError = null;
         await startGateway();
-        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+        const ready = await waitForGatewayReady({
+          timeoutMs: Number.parseInt(process.env.GATEWAY_READY_TIMEOUT_MS ?? "90000", 10) || 90_000,
+        });
         if (!ready) {
           throw new Error("Gateway did not become ready in time");
         }
@@ -1437,15 +1439,28 @@ async function ensureAzureProvider() {
   const setDefaultRaw = (process.env.AZURE_OPENAI_SET_DEFAULT ?? "1").trim().toLowerCase();
   const setDefault = !["0", "false", "no"].includes(setDefaultRaw);
 
+  // Auth method. Azure's data plane expects the static key in the `api-key` header;
+  // standard OpenAI clients send `Authorization: Bearer`. Default to "api-key" because
+  // that is what Azure AI Foundry / Azure OpenAI resources accept reliably. Set
+  // AZURE_OPENAI_AUTH=bearer to use Authorization: Bearer instead.
+  const authMode = process.env.AZURE_OPENAI_AUTH?.trim().toLowerCase() || "api-key";
+  const useApiKeyHeader = authMode === "api-key" || authMode === "apikey";
+
   const providerCfg = {
     baseUrl,
     api,
-    // Reference the env var by name so the secret is never written into the config file.
-    apiKey: "${AZURE_OPENAI_API_KEY}",
     models: [{ id: deployment, name: deployment, contextWindow, maxTokens }],
   };
+  // The secret is referenced by env-var name so it is never written into the config file.
+  if (useApiKeyHeader) {
+    providerCfg.headers = { "api-key": "${AZURE_OPENAI_API_KEY}" };
+  } else {
+    providerCfg.apiKey = "${AZURE_OPENAI_API_KEY}";
+  }
 
-  console.log(`[wrapper] Azure: configuring provider "${providerId}" -> ${baseUrl} (model: ${deployment}, api: ${api})`);
+  console.log(
+    `[wrapper] Azure: configuring provider "${providerId}" -> ${baseUrl} (model: ${deployment}, api: ${api}, auth: ${useApiKeyHeader ? "api-key header" : "bearer"})`,
+  );
   try {
     // Merge so we don't clobber other providers (Anthropic/OpenAI/etc.).
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "models.mode", "merge"]));

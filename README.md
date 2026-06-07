@@ -64,7 +64,10 @@ Required:
   full base URL ending in `/openai/v1/`)
 
 Optional:
-- `AZURE_OPENAI_API` — `openai-completions` (default) or `openai-responses`
+- `AZURE_OPENAI_API` — `openai-completions` (default) or `openai-responses` (use
+  `openai-responses` for GPT-5 / Codex / reasoning deployments, which are Responses-only)
+- `AZURE_OPENAI_AUTH` — `api-key` (default; sends the key in the `api-key` header, which
+  Azure expects) or `bearer` (sends `Authorization: Bearer`, standard OpenAI style)
 - `AZURE_OPENAI_CONTEXT_WINDOW` — integer (default `128000`)
 - `AZURE_OPENAI_MAX_TOKENS` — integer (default `16384`)
 - `AZURE_OPENAI_PROVIDER_ID` — provider id (default `azure`)
