@@ -1486,6 +1486,40 @@ async function ensureAzureProvider() {
   }
 }
 
+// Configure git to authenticate to GitHub as the GitHub App, so the code agent (EVA) can
+// clone/push/open PRs without a human token. Env-driven and idempotent:
+//   GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, GITHUB_APP_PRIVATE_KEY (PEM) — required
+//   GITHUB_APP_BOT_NAME / GITHUB_APP_BOT_EMAIL — optional commit identity overrides
+// The actual token minting happens in src/github-credential-helper.mjs (called by git).
+async function ensureGitHubAppAuth() {
+  const appId = process.env.GITHUB_APP_ID?.trim();
+  const installationId = process.env.GITHUB_APP_INSTALLATION_ID?.trim();
+  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+
+  // Only act when the operator has opted in via env.
+  if (!appId && !installationId && !privateKey) return;
+  if (!appId || !installationId || !privateKey) {
+    console.warn("[wrapper] GitHub App: need GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY; skipping git auth setup");
+    return;
+  }
+
+  const helperPath = path.join(process.cwd(), "src", "github-credential-helper.mjs");
+  const botName = process.env.GITHUB_APP_BOT_NAME?.trim() || "ahody-agent[bot]";
+  const botEmail = process.env.GITHUB_APP_BOT_EMAIL?.trim() || `${appId}+ahody-agent[bot]@users.noreply.github.com`;
+
+  console.log("[wrapper] GitHub App: configuring git credential helper for github.com");
+  try {
+    // Route github.com auth through our token-minting helper (the leading "!" runs it as a command).
+    await runCmd("git", ["config", "--global", "credential.https://github.com.helper", `!node ${helperPath}`]);
+    await runCmd("git", ["config", "--global", "credential.https://github.com.useHttpPath", "false"]);
+    await runCmd("git", ["config", "--global", "user.name", botName]);
+    await runCmd("git", ["config", "--global", "user.email", botEmail]);
+    console.log(`[wrapper] GitHub App: git configured (commits authored by ${botName})`);
+  } catch (err) {
+    console.warn(`[wrapper] GitHub App: failed to configure git (continuing): ${String(err)}`);
+  }
+}
+
 const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
@@ -1549,6 +1583,13 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     } catch (err) {
       console.warn(`[wrapper] Azure provider setup failed (continuing): ${String(err)}`);
     }
+  }
+
+  // Configure git → GitHub App auth (if env vars are set) so EVA can clone/push/open PRs.
+  try {
+    await ensureGitHubAppAuth();
+  } catch (err) {
+    console.warn(`[wrapper] GitHub App auth setup failed (continuing): ${String(err)}`);
   }
 
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
