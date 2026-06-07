@@ -48,6 +48,33 @@ Then:
 - Complete setup
 - Visit `https://<your-app>.up.railway.app/` and `/openclaw` (same Basic auth)
 
+## Use Azure OpenAI / Azure AI Foundry models
+
+You can point OpenClaw at your Azure AI Foundry deployment using Azure's
+OpenAI-compatible **v1** endpoint. Set these as **Railway Variables** and redeploy —
+the wrapper registers the provider (and, by default, makes it the default agent model)
+automatically on every boot. The API key is only ever read from the env var; it is never
+written into the repo.
+
+Required:
+- `AZURE_OPENAI_API_KEY` — your Azure key
+- `AZURE_OPENAI_DEPLOYMENT` — your deployment name (used as the model id, e.g. `gpt-4o`)
+- `AZURE_OPENAI_RESOURCE` — your resource name, i.e. the subdomain in
+  `https://<resource>.openai.azure.com` (alternatively set `AZURE_OPENAI_BASE_URL` to the
+  full base URL ending in `/openai/v1/`)
+
+Optional:
+- `AZURE_OPENAI_API` — `openai-completions` (default) or `openai-responses`
+- `AZURE_OPENAI_CONTEXT_WINDOW` — integer (default `128000`)
+- `AZURE_OPENAI_MAX_TOKENS` — integer (default `16384`)
+- `AZURE_OPENAI_PROVIDER_ID` — provider id (default `azure`)
+- `AZURE_OPENAI_SET_DEFAULT` — set to `0`/`false` to register the provider **without**
+  making it the default agent model (default: it becomes the default)
+
+This merges into your existing config, so other providers (Anthropic/OpenAI/etc.) are kept.
+To switch a single agent instead of the global default, leave `AZURE_OPENAI_SET_DEFAULT=0`
+and use `/model azure/<deployment>` in that agent's chat.
+
 ## Support / community
 
 - GitHub Issues: https://github.com/vignesh07/clawdbot-railway-template/issues

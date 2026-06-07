@@ -1391,6 +1391,82 @@ app.use(requireDashboardAuth, async (req, res) => {
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
+// Optionally register an Azure OpenAI (Azure AI Foundry) provider from environment
+// variables, so the template is reproducible: set the Railway variables below and the
+// provider (and optionally the default agent model) is configured on every boot,
+// idempotently. No secrets are written to the repo — the API key is referenced from the
+// env var by name (${AZURE_OPENAI_API_KEY}) and resolved by OpenClaw at runtime.
+//
+//   AZURE_OPENAI_API_KEY        (required) the Azure key (kept only as a Railway variable)
+//   AZURE_OPENAI_DEPLOYMENT     (required) deployment name; used as the model id
+//   AZURE_OPENAI_RESOURCE       resource name -> https://<resource>.openai.azure.com/openai/v1/
+//   AZURE_OPENAI_BASE_URL       optional: override the full base URL instead of RESOURCE
+//   AZURE_OPENAI_API            optional: "openai-completions" (default) or "openai-responses"
+//   AZURE_OPENAI_CONTEXT_WINDOW optional: integer (default 128000)
+//   AZURE_OPENAI_MAX_TOKENS     optional: integer (default 16384)
+//   AZURE_OPENAI_PROVIDER_ID    optional: provider id (default "azure")
+//   AZURE_OPENAI_SET_DEFAULT    optional: "0"/"false" to NOT set the default model (default on)
+async function ensureAzureProvider() {
+  const key = process.env.AZURE_OPENAI_API_KEY?.trim();
+  const resource = process.env.AZURE_OPENAI_RESOURCE?.trim();
+  const baseUrlOverride = process.env.AZURE_OPENAI_BASE_URL?.trim();
+  const deployment = process.env.AZURE_OPENAI_DEPLOYMENT?.trim();
+
+  // Only act when the operator has opted in via env. If none of these are set, do nothing.
+  if (!key && !resource && !baseUrlOverride && !deployment) return;
+
+  if (!deployment) {
+    console.warn("[wrapper] Azure: AZURE_OPENAI_DEPLOYMENT not set; skipping Azure provider setup");
+    return;
+  }
+  const baseUrl =
+    baseUrlOverride || (resource ? `https://${resource}.openai.azure.com/openai/v1/` : "");
+  if (!baseUrl) {
+    console.warn("[wrapper] Azure: set AZURE_OPENAI_RESOURCE or AZURE_OPENAI_BASE_URL; skipping Azure provider setup");
+    return;
+  }
+  if (!key) {
+    console.warn("[wrapper] Azure: AZURE_OPENAI_API_KEY not set; skipping Azure provider setup");
+    return;
+  }
+
+  const providerId = (process.env.AZURE_OPENAI_PROVIDER_ID?.trim() || "azure").replace(/[^A-Za-z0-9_-]/g, "");
+  const api = process.env.AZURE_OPENAI_API?.trim() === "openai-responses" ? "openai-responses" : "openai-completions";
+  const contextWindow = Number.parseInt(process.env.AZURE_OPENAI_CONTEXT_WINDOW ?? "128000", 10) || 128000;
+  const maxTokens = Number.parseInt(process.env.AZURE_OPENAI_MAX_TOKENS ?? "16384", 10) || 16384;
+  const setDefaultRaw = (process.env.AZURE_OPENAI_SET_DEFAULT ?? "1").trim().toLowerCase();
+  const setDefault = !["0", "false", "no"].includes(setDefaultRaw);
+
+  const providerCfg = {
+    baseUrl,
+    api,
+    // Reference the env var by name so the secret is never written into the config file.
+    apiKey: "${AZURE_OPENAI_API_KEY}",
+    models: [{ id: deployment, name: deployment, contextWindow, maxTokens }],
+  };
+
+  console.log(`[wrapper] Azure: configuring provider "${providerId}" -> ${baseUrl} (model: ${deployment}, api: ${api})`);
+  try {
+    // Merge so we don't clobber other providers (Anthropic/OpenAI/etc.).
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "models.mode", "merge"]));
+    await runCmd(
+      OPENCLAW_NODE,
+      clawArgs(["config", "set", "--json", `models.providers.${providerId}`, JSON.stringify(providerCfg)]),
+    );
+    if (setDefault) {
+      await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["config", "set", "agents.defaults.model.primary", `${providerId}/${deployment}`]),
+      );
+    }
+    console.log(
+      `[wrapper] Azure: provider configured${setDefault ? ` and set as default model (${providerId}/${deployment})` : ""}`,
+    );
+  } catch (err) {
+    console.warn(`[wrapper] Azure: failed to configure provider (continuing): ${String(err)}`);
+  }
+}
+
 const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
@@ -1443,6 +1519,16 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       console.log("[wrapper] gateway tokens synced");
     } catch (err) {
       console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+    }
+  }
+
+  // Apply Azure OpenAI provider config from env vars (if set) before the gateway starts,
+  // so the gateway picks it up immediately. Idempotent and merge-safe.
+  if (isConfigured()) {
+    try {
+      await ensureAzureProvider();
+    } catch (err) {
+      console.warn(`[wrapper] Azure provider setup failed (continuing): ${String(err)}`);
     }
   }
 
