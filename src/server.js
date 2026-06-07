@@ -1449,13 +1449,17 @@ async function ensureAzureProvider() {
   const providerCfg = {
     baseUrl,
     api,
+    // The secret is referenced by env-var name so it is never written into the config file.
+    // Always set apiKey: OpenClaw uses it to register that the provider has a credential
+    // (its per-agent auth check fails with "No API key found for provider" otherwise).
+    apiKey: "${AZURE_OPENAI_API_KEY}",
     models: [{ id: deployment, name: deployment, contextWindow, maxTokens }],
   };
-  // The secret is referenced by env-var name so it is never written into the config file.
+  // Azure's data plane authenticates via the `api-key` header. Also send the key there so
+  // the request is accepted (OpenClaw additionally sends Authorization: Bearer from apiKey,
+  // which Azure ignores when a valid api-key header is present).
   if (useApiKeyHeader) {
     providerCfg.headers = { "api-key": "${AZURE_OPENAI_API_KEY}" };
-  } else {
-    providerCfg.apiKey = "${AZURE_OPENAI_API_KEY}";
   }
 
   console.log(
