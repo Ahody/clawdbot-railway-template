@@ -1543,6 +1543,36 @@ function bugsinkSignature(iss) {
   return `${iss.calculated_type || ""}::${v}`;
 }
 
+// Fetch open (non-completed/canceled) Linear issues for the configured team, so Kent can link an
+// existing issue instead of proposing a duplicate. Read-only GraphQL — never writes to Linear.
+//   LINEAR_API_KEY (personal API key), LINEAR_TEAM_ID
+async function fetchLinearOpenIssues() {
+  const key = process.env.LINEAR_API_KEY?.trim();
+  const teamId = process.env.LINEAR_TEAM_ID?.trim();
+  if (!key || !teamId) return [];
+  const query = `query($teamId: String!) {
+    team(id: $teamId) {
+      issues(first: 50, filter: { state: { type: { nin: ["completed", "canceled"] } } }) {
+        nodes { identifier title url }
+      }
+    }
+  }`;
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: key },
+      body: JSON.stringify({ query, variables: { teamId } }),
+    });
+    if (!res.ok) { console.warn(`[bugsink-poll] Linear HTTP ${res.status}`); return []; }
+    const data = await res.json();
+    if (data?.errors) { console.warn(`[bugsink-poll] Linear errors: ${JSON.stringify(data.errors).slice(0, 300)}`); return []; }
+    return data?.data?.team?.issues?.nodes || [];
+  } catch (err) {
+    console.warn(`[bugsink-poll] Linear fetch failed: ${String(err)}`);
+    return [];
+  }
+}
+
 async function pollBugsinkOnce() {
   const url = process.env.BUGSINK_URL?.trim();
   const token = process.env.BUGSINK_API_TOKEN?.trim();
@@ -1596,13 +1626,23 @@ async function pollBugsinkOnce() {
   const linkFor = (f) => urlTmpl.replace("{id}", f.uuid).replace("{project}", String(f.project)).replace("{friendly}", f.friendly);
   const lines = fresh.map((f) => `- ${f.friendly} ${f.type}: ${f.value} (${f.events} events) → ${linkFor(f)}`).join("\n");
 
+  const linearOpen = await fetchLinearOpenIssues();
+  const linearList = linearOpen.length
+    ? linearOpen.map((i) => `- ${i.identifier}: ${i.title} (${i.url})`).join("\n")
+    : "(inga öppna Linear-issues hämtade)";
+
   const prompt = [
     "Nya BugSink-issues upptäckta:",
     lines,
     "",
+    "Öppna Linear-issues just nu (team AHO):",
+    linearList,
+    "",
     "Du är Kent, drift-agent. Svara på REN SVENSKA.",
     "Bedöm allvar och ignorera brus/smoke-tester. Skriv INGENTING om inget behöver göras.",
     "Om flera issues i listan har samma grundorsak: slå ihop dem till EN incident, inte flera.",
+    "Om en BugSink-issue matchar en BEFINTLIG öppen Linear-issue ovan: länka den (identifier + URL) istället för att föreslå en ny.",
+    "Om ingen matchar: föreslå att skapa en ny Linear-issue via Linear-shortcuten på detta Slack-meddelande (skapa INTE själv i Linear).",
     "Om minst en issue är viktig: skriv ett kort incident-meddelande på svenska med BugSink-länken,",
     "och placera HELA meddelandet mellan markörerna <<<POST>>> och <<<END>>>.",
     "Använd BugSink-länkarna EXAKT som de står ovan — ändra eller förkorta dem inte.",
