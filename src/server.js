@@ -1575,7 +1575,7 @@ async function pollBugsinkOnce() {
 
   // BugSink issue web-URL (override the format with BUGSINK_ISSUE_URL_TEMPLATE if it differs).
   const base = url.replace(/\/$/, "");
-  const urlTmpl = process.env.BUGSINK_ISSUE_URL_TEMPLATE?.trim() || `${base}/issues/issue/{id}/`;
+  const urlTmpl = process.env.BUGSINK_ISSUE_URL_TEMPLATE?.trim() || `${base}/issues/issue/{id}/event/last/`;
   const linkFor = (f) => urlTmpl.replace("{id}", f.uuid).replace("{project}", String(f.project)).replace("{friendly}", f.friendly);
   const lines = fresh.map((f) => `- ${f.friendly} ${f.type}: ${f.value} (${f.events} events) → ${linkFor(f)}`).join("\n");
 
@@ -1587,6 +1587,7 @@ async function pollBugsinkOnce() {
     "Bedöm allvar och ignorera brus/smoke-tester. Skriv INGENTING om inget behöver göras.",
     "Om minst en issue är viktig: skriv ett kort incident-meddelande på svenska med BugSink-länken,",
     "och placera HELA meddelandet mellan markörerna <<<POST>>> och <<<END>>>.",
+    "Använd BugSink-länkarna EXAKT som de står ovan — ändra eller förkorta dem inte.",
     "Om inget är viktigt: svara med ENBART <<<SKIP>>> och inget annat.",
   ].join("\n");
 
