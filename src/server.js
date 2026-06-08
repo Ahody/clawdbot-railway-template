@@ -1555,7 +1555,8 @@ async function pollBugsinkOnce() {
           seen.add(iss.id);
           fresh.push({
             project: pid,
-            id: iss.friendly_id || iss.id,
+            uuid: iss.id,
+            friendly: iss.friendly_id || iss.id,
             type: iss.calculated_type,
             value: iss.calculated_value,
             events: iss.stored_event_count,
@@ -1572,22 +1573,49 @@ async function pollBugsinkOnce() {
   if (firstRun) { console.log(`[bugsink-poll] seeded ${seen.size} existing issue(s); escalation starts on next new issue`); return; }
   if (!fresh.length) return;
 
-  const lines = fresh.map((f) => `- [project ${f.project}] ${f.id} ${f.type}: ${f.value} (${f.events} events, last ${f.last_seen})`).join("\n");
-  const message = [
-    "New BugSink issues detected:",
+  // BugSink issue web-URL (override the format with BUGSINK_ISSUE_URL_TEMPLATE if it differs).
+  const base = url.replace(/\/$/, "");
+  const urlTmpl = process.env.BUGSINK_ISSUE_URL_TEMPLATE?.trim() || `${base}/issues/issue/{id}/`;
+  const linkFor = (f) => urlTmpl.replace("{id}", f.uuid).replace("{project}", String(f.project)).replace("{friendly}", f.friendly);
+  const lines = fresh.map((f) => `- ${f.friendly} ${f.type}: ${f.value} (${f.events} events) → ${linkFor(f)}`).join("\n");
+
+  const prompt = [
+    "Nya BugSink-issues upptäckta:",
     lines,
     "",
-    "You are Kent, the ops agent. Triage these: dedupe, judge severity, ignore known noise / low signal.",
-    "Escalate ONLY the genuinely important ones to this channel — a concise summary + recommended next action (and whether to dispatch EVA).",
-    "If none warrant action, reply with one short line that no action is needed.",
+    "Du är Kent, drift-agent. Svara på REN SVENSKA.",
+    "Bedöm allvar och ignorera brus/smoke-tester. Skriv INGENTING om inget behöver göras.",
+    "Om minst en issue är viktig: skriv ett kort incident-meddelande på svenska med BugSink-länken,",
+    "och placera HELA meddelandet mellan markörerna <<<POST>>> och <<<END>>>.",
+    "Om inget är viktigt: svara med ENBART <<<SKIP>>> och inget annat.",
   ].join("\n");
 
-  console.log(`[bugsink-poll] ${fresh.length} new issue(s) → handing to agent "${agentId}"`);
+  console.log(`[bugsink-poll] ${fresh.length} new issue(s) → triaging with agent "${agentId}"`);
+  let out = "";
   try {
-    // NOTE: verify these flags against `openclaw agent --help` for your version.
-    await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agentId, "--to", target, "--message", message, "--deliver"]), { timeoutMs: 180_000 });
+    // NOTE: verify flags against `openclaw agent --help` (no --deliver: we capture the reply).
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agentId, "--message", prompt]), { timeoutMs: 180_000 });
+    out = r.output || "";
   } catch (err) {
-    console.warn(`[bugsink-poll] agent handoff failed: ${String(err)}`);
+    console.warn(`[bugsink-poll] triage failed: ${String(err)}`);
+    return;
+  }
+
+  // Stay silent unless Kent produced a message between the markers.
+  if (/<<<SKIP>>>/.test(out) || !/<<<POST>>>/.test(out)) {
+    console.log("[bugsink-poll] Kent: no action needed (silent)");
+    return;
+  }
+  const m = out.match(/<<<POST>>>([\s\S]*?)<<<END>>>/);
+  const slackMsg = (m ? m[1] : "").trim();
+  if (!slackMsg) { console.log("[bugsink-poll] empty triage message, skipping"); return; }
+
+  try {
+    // NOTE: verify flags against `openclaw message send --help`.
+    await runCmd(OPENCLAW_NODE, clawArgs(["message", "send", "--channel", "slack", "--target", target, "--message", slackMsg]), { timeoutMs: 60_000 });
+    console.log("[bugsink-poll] incident posted to Slack");
+  } catch (err) {
+    console.warn(`[bugsink-poll] slack send failed: ${String(err)}`);
   }
 }
 
