@@ -1528,6 +1528,20 @@ async function ensureGitHubAppAuth() {
 //   INCIDENT_SLACK_TARGET            OpenClaw delivery target, e.g. "channel:C0XXXXXXX"
 //   BUGSINK_KENT_AGENT               agent id to triage (default "kent")
 //   BUGSINK_POLL_INTERVAL_MS         default 300000 (5 min)
+// Redact sensitive data (tokens, emails, PII, ID numbers) before it reaches Kent or Slack.
+// Compliance backstop (SOC2/GDPR/ISO27001) — the primary scrubbing happens at the source SDK,
+// this ensures nothing sensitive propagates downstream even if it slipped into an error value.
+function redactSensitive(s) {
+  return String(s || "")
+    .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]")
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[jwt]")
+    .replace(/\b(?:sbp|sb_secret|sb_publishable|sb)_[A-Za-z0-9_-]{8,}/g, "[supabase-key]")
+    .replace(/\bgh[posur]_[A-Za-z0-9]{20,}/gi, "[gh-token]")
+    .replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\b\d{6,8}[-+]?\d{4}\b/g, "[pnr/orgnr]")
+    .replace(/\b[A-Fa-f0-9]{40,}\b/g, "[secret]");
+}
+
 // Normalize a BugSink issue into a stable signature so the same logical error — even across
 // separate issue ids (messages that differ only by a number/uuid/timestamp/test marker) — is
 // reported once and not re-spammed.
@@ -1624,7 +1638,7 @@ async function pollBugsinkOnce() {
   const base = url.replace(/\/$/, "");
   const urlTmpl = process.env.BUGSINK_ISSUE_URL_TEMPLATE?.trim() || `${base}/issues/issue/{id}/event/last/`;
   const linkFor = (f) => urlTmpl.replace("{id}", f.uuid).replace("{project}", String(f.project)).replace("{friendly}", f.friendly);
-  const lines = fresh.map((f) => `- ${f.friendly} ${f.type}: ${f.value} (${f.events} events) → ${linkFor(f)}`).join("\n");
+  const lines = fresh.map((f) => `- ${f.friendly} ${f.type}: ${redactSensitive(f.value)} (${f.events} events) → ${linkFor(f)}`).join("\n");
 
   const linearOpen = await fetchLinearOpenIssues();
   const linearList = linearOpen.length
@@ -1646,6 +1660,7 @@ async function pollBugsinkOnce() {
     "Om minst en issue är viktig: skriv ett kort incident-meddelande på svenska med BugSink-länken,",
     "och placera HELA meddelandet mellan markörerna <<<POST>>> och <<<END>>>.",
     "Använd BugSink-länkarna EXAKT som de står ovan — ändra eller förkorta dem inte.",
+    "Inkludera ALDRIG personuppgifter, e-post, tokens, nycklar eller företags-/kunddata i meddelandet (SOC2/GDPR/ISO27001).",
     "Om inget är viktigt: svara med ENBART <<<SKIP>>> och inget annat.",
   ].join("\n");
 
