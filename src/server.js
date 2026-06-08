@@ -1520,6 +1520,86 @@ async function ensureGitHubAppAuth() {
   }
 }
 
+// BugSink → Kent incident poller (Variant B). Polls the BugSink read API for new issues and
+// hands them to the Kent agent, who triages and delivers ONLY what matters to a Slack incident
+// channel (so not every error floods the channel). Env-driven and idempotent:
+//   BUGSINK_URL, BUGSINK_API_TOKEN   (required to enable)
+//   BUGSINK_PROJECTS                 comma-separated project ids to watch, e.g. "1,2" (prod+staging)
+//   INCIDENT_SLACK_TARGET            OpenClaw delivery target, e.g. "channel:C0XXXXXXX"
+//   BUGSINK_KENT_AGENT               agent id to triage (default "kent")
+//   BUGSINK_POLL_INTERVAL_MS         default 300000 (5 min)
+async function pollBugsinkOnce() {
+  const url = process.env.BUGSINK_URL?.trim();
+  const token = process.env.BUGSINK_API_TOKEN?.trim();
+  const projects = (process.env.BUGSINK_PROJECTS || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const target = process.env.INCIDENT_SLACK_TARGET?.trim();
+  if (!url || !token || !projects.length || !target) return;
+  const agentId = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
+
+  const statePath = path.join(STATE_DIR, "bugsink-seen.json");
+  const firstRun = !fs.existsSync(statePath);
+  let seen;
+  try { seen = new Set(JSON.parse(fs.readFileSync(statePath, "utf8"))); } catch { seen = new Set(); }
+
+  const fresh = [];
+  for (const pid of projects) {
+    try {
+      const res = await fetch(`${url}/api/canonical/0/issues/?project=${encodeURIComponent(pid)}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      });
+      if (!res.ok) { console.warn(`[bugsink-poll] project ${pid}: HTTP ${res.status}`); continue; }
+      const data = await res.json();
+      for (const iss of data?.results || []) {
+        if (iss.is_resolved || iss.is_muted) continue;
+        if (iss.id && !seen.has(iss.id)) {
+          seen.add(iss.id);
+          fresh.push({
+            project: pid,
+            id: iss.friendly_id || iss.id,
+            type: iss.calculated_type,
+            value: iss.calculated_value,
+            events: iss.stored_event_count,
+            last_seen: iss.last_seen,
+          });
+        }
+      }
+    } catch (err) { console.warn(`[bugsink-poll] project ${pid}: ${String(err)}`); }
+  }
+
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.writeFileSync(statePath, JSON.stringify([...seen])); } catch {}
+
+  // First run: seed the seen-set from existing issues but do NOT escalate the backlog.
+  if (firstRun) { console.log(`[bugsink-poll] seeded ${seen.size} existing issue(s); escalation starts on next new issue`); return; }
+  if (!fresh.length) return;
+
+  const lines = fresh.map((f) => `- [project ${f.project}] ${f.id} ${f.type}: ${f.value} (${f.events} events, last ${f.last_seen})`).join("\n");
+  const message = [
+    "New BugSink issues detected:",
+    lines,
+    "",
+    "You are Kent, the ops agent. Triage these: dedupe, judge severity, ignore known noise / low signal.",
+    "Escalate ONLY the genuinely important ones to this channel — a concise summary + recommended next action (and whether to dispatch EVA).",
+    "If none warrant action, reply with one short line that no action is needed.",
+  ].join("\n");
+
+  console.log(`[bugsink-poll] ${fresh.length} new issue(s) → handing to agent "${agentId}"`);
+  try {
+    // NOTE: verify these flags against `openclaw agent --help` for your version.
+    await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agentId, "--to", target, "--message", message, "--deliver"]), { timeoutMs: 180_000 });
+  } catch (err) {
+    console.warn(`[bugsink-poll] agent handoff failed: ${String(err)}`);
+  }
+}
+
+function startBugsinkPoller() {
+  if (!process.env.BUGSINK_URL?.trim() || !process.env.BUGSINK_API_TOKEN?.trim()) return;
+  const interval = Number.parseInt(process.env.BUGSINK_POLL_INTERVAL_MS ?? "300000", 10) || 300_000;
+  console.log(`[wrapper] BugSink → Kent poller enabled (every ${Math.round(interval / 1000)}s)`);
+  setTimeout(() => pollBugsinkOnce().catch((e) => console.warn("[bugsink-poll]", String(e))), 30_000);
+  const t = setInterval(() => pollBugsinkOnce().catch((e) => console.warn("[bugsink-poll]", String(e))), interval);
+  t.unref?.();
+}
+
 const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
@@ -1590,6 +1670,13 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     await ensureGitHubAppAuth();
   } catch (err) {
     console.warn(`[wrapper] GitHub App auth setup failed (continuing): ${String(err)}`);
+  }
+
+  // Start the BugSink → Kent incident poller (no-op unless BUGSINK_* env vars are set).
+  try {
+    startBugsinkPoller();
+  } catch (err) {
+    console.warn(`[wrapper] BugSink poller failed to start (continuing): ${String(err)}`);
   }
 
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
