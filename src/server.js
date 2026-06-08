@@ -6,6 +6,7 @@ import path from "node:path";
 
 import express from "express";
 import httpProxy from "http-proxy";
+import pg from "pg";
 import * as tar from "tar";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
@@ -1367,6 +1368,97 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
 });
 
+// --- Log ingest (Supabase/Railway "Custom Endpoint" drain) → logs Postgres ---
+// Receives log batches over HTTP, redacts sensitive data (SOC2/GDPR/ISO27001), and writes them
+// to the logs DB that Kent reads (read-only via kent_logs_reader) for ops triage.
+//   LOGS_DB_WRITE_URL   write connection to the logs Postgres (creates table + inserts)
+//   LOGS_INGEST_TOKEN   shared secret required as Authorization: Bearer <token>
+let logsPool = null;
+function getLogsPool() {
+  if (!process.env.LOGS_DB_WRITE_URL?.trim()) return null;
+  if (!logsPool) {
+    logsPool = new pg.Pool({
+      connectionString: process.env.LOGS_DB_WRITE_URL.trim(),
+      ssl: { rejectUnauthorized: false },
+      max: 4,
+    });
+    logsPool.on("error", (e) => console.warn("[logs-ingest] pool error:", String(e)));
+  }
+  return logsPool;
+}
+
+async function ensureLogsTable() {
+  const pool = getLogsPool();
+  if (!pool) return;
+  try {
+    await pool.query(`create table if not exists public.ingested_logs (
+        id bigserial primary key,
+        received_at timestamptz not null default now(),
+        source text,
+        log_timestamp timestamptz,
+        level text,
+        message text,
+        meta jsonb)`);
+    await pool.query(`create index if not exists ingested_logs_received_at_idx on public.ingested_logs (received_at desc)`);
+    console.log("[logs-ingest] logs table ready");
+  } catch (err) {
+    console.warn(`[logs-ingest] ensure table failed: ${String(err)}`);
+  }
+}
+
+function extractLogEvents(body) {
+  if (Array.isArray(body)) return body;
+  for (const k of ["events", "logs", "data", "result", "records"]) if (Array.isArray(body?.[k])) return body[k];
+  if (body && typeof body === "object") return [body];
+  return [];
+}
+
+function pickLogTs(ev) {
+  const t = ev.timestamp ?? ev.time ?? ev.log_timestamp ?? ev.ts;
+  if (t == null) return null;
+  if (typeof t === "number") {
+    const ms = t > 1e15 ? t / 1000 : t > 1e12 ? t : t * 1000;
+    try { return new Date(ms).toISOString(); } catch { return null; }
+  }
+  return String(t).slice(0, 64);
+}
+
+app.post("/ingest/logs", express.json({ limit: "5mb" }), async (req, res) => {
+  const token = process.env.LOGS_INGEST_TOKEN?.trim();
+  if (!token || (req.headers.authorization || "") !== `Bearer ${token}`) {
+    return res.status(401).type("text/plain").send("unauthorized");
+  }
+  const pool = getLogsPool();
+  if (!pool) return res.status(503).type("text/plain").send("logs DB not configured");
+
+  const source = String(req.query.source || req.headers["x-log-source"] || "supabase").slice(0, 64);
+  const events = extractLogEvents(req.body);
+  if (!events.length) {
+    console.log("[logs-ingest] empty batch; body keys:", Object.keys(req.body || {}).join(","));
+    return res.status(204).end();
+  }
+
+  let inserted = 0;
+  try {
+    for (const ev of events) {
+      const message = redactSensitive(ev.event_message ?? ev.message ?? ev.msg ?? (typeof ev === "string" ? ev : "")).slice(0, 8000);
+      const level = String(ev.level ?? ev.metadata?.level ?? ev.severity ?? "").slice(0, 32) || null;
+      let meta = null;
+      const metaRaw = ev.metadata ?? ev.meta ?? null;
+      if (metaRaw) { try { meta = JSON.parse(redactSensitive(JSON.stringify(metaRaw))); } catch { meta = null; } }
+      await pool.query(
+        `insert into public.ingested_logs (source, log_timestamp, level, message, meta) values ($1,$2,$3,$4,$5)`,
+        [source, pickLogTs(ev), level, message, meta],
+      );
+      inserted++;
+    }
+    res.status(200).type("text/plain").send(`ok ${inserted}`);
+  } catch (err) {
+    console.warn(`[logs-ingest] insert failed: ${String(err)}`);
+    res.status(500).type("text/plain").send("insert error");
+  }
+});
+
 app.use(requireDashboardAuth, async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
@@ -1779,6 +1871,13 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     startBugsinkPoller();
   } catch (err) {
     console.warn(`[wrapper] BugSink poller failed to start (continuing): ${String(err)}`);
+  }
+
+  // Ensure the logs-ingest table exists (no-op unless LOGS_DB_WRITE_URL is set).
+  try {
+    await ensureLogsTable();
+  } catch (err) {
+    console.warn(`[wrapper] logs table init failed (continuing): ${String(err)}`);
   }
 
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
