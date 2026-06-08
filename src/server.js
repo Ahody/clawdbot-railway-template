@@ -1528,6 +1528,21 @@ async function ensureGitHubAppAuth() {
 //   INCIDENT_SLACK_TARGET            OpenClaw delivery target, e.g. "channel:C0XXXXXXX"
 //   BUGSINK_KENT_AGENT               agent id to triage (default "kent")
 //   BUGSINK_POLL_INTERVAL_MS         default 300000 (5 min)
+// Normalize a BugSink issue into a stable signature so the same logical error — even across
+// separate issue ids (messages that differ only by a number/uuid/timestamp/test marker) — is
+// reported once and not re-spammed.
+function bugsinkSignature(iss) {
+  const v = String(iss.calculated_value || "")
+    .toLowerCase()
+    .replace(/\[test#[^\]]*\]/g, "")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "")
+    .replace(/\d{4}-\d{2}-\d{2}t[\d:.z+-]+/gi, "")
+    .replace(/\d+/g, "#")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${iss.calculated_type || ""}::${v}`;
+}
+
 async function pollBugsinkOnce() {
   const url = process.env.BUGSINK_URL?.trim();
   const token = process.env.BUGSINK_API_TOKEN?.trim();
@@ -1536,7 +1551,8 @@ async function pollBugsinkOnce() {
   if (!url || !token || !projects.length || !target) return;
   const agentId = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
 
-  const statePath = path.join(STATE_DIR, "bugsink-seen.json");
+  // Dedupe by error signature (not raw issue id) so duplicates of the same problem don't spam.
+  const statePath = path.join(STATE_DIR, "bugsink-seen-v2.json");
   const firstRun = !fs.existsSync(statePath);
   let seen;
   try { seen = new Set(JSON.parse(fs.readFileSync(statePath, "utf8"))); } catch { seen = new Set(); }
@@ -1551,8 +1567,9 @@ async function pollBugsinkOnce() {
       const data = await res.json();
       for (const iss of data?.results || []) {
         if (iss.is_resolved || iss.is_muted) continue;
-        if (iss.id && !seen.has(iss.id)) {
-          seen.add(iss.id);
+        const signature = bugsinkSignature(iss);
+        if (iss.id && !seen.has(signature)) {
+          seen.add(signature);
           fresh.push({
             project: pid,
             uuid: iss.id,
@@ -1585,6 +1602,7 @@ async function pollBugsinkOnce() {
     "",
     "Du är Kent, drift-agent. Svara på REN SVENSKA.",
     "Bedöm allvar och ignorera brus/smoke-tester. Skriv INGENTING om inget behöver göras.",
+    "Om flera issues i listan har samma grundorsak: slå ihop dem till EN incident, inte flera.",
     "Om minst en issue är viktig: skriv ett kort incident-meddelande på svenska med BugSink-länken,",
     "och placera HELA meddelandet mellan markörerna <<<POST>>> och <<<END>>>.",
     "Använd BugSink-länkarna EXAKT som de står ovan — ändra eller förkorta dem inte.",
