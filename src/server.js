@@ -1679,6 +1679,58 @@ async function fetchLinearOpenIssues() {
   }
 }
 
+// Resolve Sentry-style tags (array of [k,v], array of {key,value}, or object) into a flat map.
+function normalizeTags(t) {
+  const out = {};
+  if (Array.isArray(t)) {
+    for (const e of t) {
+      if (Array.isArray(e)) out[e[0]] = e[1];
+      else if (e && e.key !== undefined) out[e.key] = e.value;
+    }
+  } else if (t && typeof t === "object") {
+    Object.assign(out, t);
+  }
+  return out;
+}
+
+// Fetch the latest event for an issue and derive WHERE the error lives (db/edge/frontend/api)
+// + the route/transaction, so Kent triages with source context and matches Linear better.
+async function fetchIssueContext(base, token, issueId) {
+  try {
+    const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+    const listRes = await fetch(`${base}/api/canonical/0/events/?issue=${encodeURIComponent(issueId)}`, { headers });
+    if (!listRes.ok) return null;
+    const results = (await listRes.json())?.results || [];
+    const evId = results.length ? results[results.length - 1].id || results[0].id : null;
+    if (!evId) return null;
+    const evRes = await fetch(`${base}/api/canonical/0/events/${encodeURIComponent(evId)}/`, { headers });
+    if (!evRes.ok) return null;
+    const data = (await evRes.json())?.data || {};
+    const tags = normalizeTags(data.tags);
+    const server = tags.server_name;
+    let source = tags.source;
+    if (!source && server) source = server === "supabase-edge" ? "edge" : server === "supabase-db" ? "db" : server;
+    if (!source && tags.service) source = `api:${tags.service}`;
+    if (!source && data.platform === "javascript") source = "frontend";
+    if (!source) source = data.platform || null;
+    return {
+      source,
+      transaction: data.transaction || tags.function || null,
+      url: data.request?.url || null,
+      environment: data.environment || tags.environment || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function ctxLabel(ctx) {
+  if (!ctx || !ctx.source) return "";
+  const where = ctx.transaction || ctx.url;
+  const w = where ? " " + redactSensitive(String(where)).replace(/^https?:\/\/[^/]+/, "").slice(0, 60) : "";
+  return `[${ctx.source}${w}]`;
+}
+
 async function pollBugsinkOnce() {
   const url = process.env.BUGSINK_URL?.trim();
   const token = process.env.BUGSINK_API_TOKEN?.trim();
@@ -1730,7 +1782,11 @@ async function pollBugsinkOnce() {
   const base = url.replace(/\/$/, "");
   const urlTmpl = process.env.BUGSINK_ISSUE_URL_TEMPLATE?.trim() || `${base}/issues/issue/{id}/event/last/`;
   const linkFor = (f) => urlTmpl.replace("{id}", f.uuid).replace("{project}", String(f.project)).replace("{friendly}", f.friendly);
-  const lines = fresh.map((f) => `- ${f.friendly} ${f.type}: ${redactSensitive(f.value)} (${f.events} events) → ${linkFor(f)}`).join("\n");
+
+  // Enrich each issue with source context (db/edge/frontend/api + route) from its latest event.
+  await Promise.all(fresh.map(async (f) => { f.ctx = await fetchIssueContext(base, token, f.uuid); }));
+
+  const lines = fresh.map((f) => `- ${ctxLabel(f.ctx)} ${f.friendly} ${f.type}: ${redactSensitive(f.value)} (${f.events} events) → ${linkFor(f)}`.replace(/^- {2}/, "- ")).join("\n");
 
   const linearOpen = await fetchLinearOpenIssues();
   const linearList = linearOpen.length
@@ -1746,6 +1802,7 @@ async function pollBugsinkOnce() {
     "",
     "Du är Kent, drift-agent. Svara på REN SVENSKA.",
     "Bedöm allvar och ignorera brus/smoke-tester. Skriv INGENTING om inget behöver göras.",
+    "Käll-taggen i hakparentes ([db]/[edge]/[frontend]/[api:...] + route) visar var felet ligger — använd den i triagen och för att matcha rätt Linear-issue.",
     "Om flera issues i listan har samma grundorsak: slå ihop dem till EN incident, inte flera.",
     "Om en BugSink-issue matchar en BEFINTLIG öppen Linear-issue ovan: länka den (identifier + URL) istället för att föreslå en ny.",
     "Om ingen matchar: föreslå att skapa en ny Linear-issue via Linear-shortcuten på detta Slack-meddelande (skapa INTE själv i Linear).",
