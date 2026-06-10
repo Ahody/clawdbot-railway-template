@@ -1573,6 +1573,29 @@ async function ensureAzureProvider() {
     console.log(
       `[wrapper] Azure: provider configured${setDefault ? ` and set as default model (${providerId}/${deployment})` : ""}`,
     );
+
+    // Per-agent models.json files SHADOW the global provider list. Any agent
+    // with its own models.json but no azure block can't resolve azure/<model>
+    // and dies instantly on session start (this is exactly how eva's first-ever
+    // run failed while leo/kent worked). Mirror the provider into every agent's
+    // models.json that exists but lacks it.
+    try {
+      const agentsRoot = path.join(STATE_DIR, "agents");
+      for (const id of fs.existsSync(agentsRoot) ? fs.readdirSync(agentsRoot) : []) {
+        const mPath = path.join(agentsRoot, id, "agent", "models.json");
+        if (!fs.existsSync(mPath)) continue;
+        let m;
+        try { m = JSON.parse(fs.readFileSync(mPath, "utf8")); } catch { continue; }
+        m.providers = m.providers || {};
+        const existing = JSON.stringify(m.providers[providerId] || null);
+        if (existing === JSON.stringify(providerCfg)) continue;
+        m.providers[providerId] = providerCfg;
+        fs.writeFileSync(mPath, JSON.stringify(m, null, 2));
+        console.log(`[wrapper] Azure: mirrored provider "${providerId}" into agent "${id}" models.json`);
+      }
+    } catch (err) {
+      console.warn(`[wrapper] Azure: per-agent mirror failed (continuing): ${String(err)}`);
+    }
   } catch (err) {
     console.warn(`[wrapper] Azure: failed to configure provider (continuing): ${String(err)}`);
   }
