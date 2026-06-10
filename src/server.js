@@ -1658,8 +1658,8 @@ async function fetchLinearOpenIssues() {
   if (!key || !teamId) return [];
   const query = `query($teamId: String!) {
     team(id: $teamId) {
-      issues(first: 50, filter: { state: { type: { nin: ["completed", "canceled"] } } }) {
-        nodes { identifier title url }
+      issues(first: 100, filter: { state: { type: { nin: ["completed", "canceled"] } } }) {
+        nodes { id identifier title url }
       }
     }
   }`;
@@ -1805,7 +1805,7 @@ async function pollBugsinkOnce() {
     "Käll-taggen i hakparentes ([db]/[edge]/[frontend]/[api:...] + route) visar var felet ligger — använd den i triagen och för att matcha rätt Linear-issue.",
     "Om flera issues i listan har samma grundorsak: slå ihop dem till EN incident, inte flera.",
     "Om en BugSink-issue matchar en BEFINTLIG öppen Linear-issue ovan: länka den (identifier + URL) istället för att föreslå en ny.",
-    "Om ingen matchar: föreslå att skapa en ny Linear-issue via Linear-shortcuten på detta Slack-meddelande (skapa INTE själv i Linear).",
+    "Om ingen matchar: skriv att en ny Linear-issue kan skapas genom 👍 eller svaret 'skapa' i tråden (skapa INTE själv — det sker automatiskt efter mänskligt godkännande).",
     "Om minst en issue är viktig: skriv ett kort incident-meddelande på svenska med BugSink-länken,",
     "och placera HELA meddelandet mellan markörerna <<<POST>>> och <<<END>>>.",
     "Använd BugSink-länkarna EXAKT som de står ovan — ändra eller förkorta dem inte.",
@@ -1932,7 +1932,7 @@ async function postIncidentToSlack(text, context) {
   const channel = slackChannelId();
   if (dispatchEnabled() && slackToken() && channel) {
     const kw = (process.env.DISPATCH_APPROVE_KEYWORDS || "skapa,go,ja,kör,approve,dispatch").split(",")[0].trim();
-    const hint = `\n\n_👍 eller svara "${kw}" i tråden för att skapa Linear-issue + dispatcha Leo._`;
+    const hint = `\n\n_👍 eller svara "${kw}" i tråden → Linear-issue skapas i Backlog (flytta till Todo för att låta Leo dispatcha)._`;
     const r = await slackCall("chat.postMessage", { channel, text: text + hint });
     if (r?.ok && r.ts) {
       const threads = dispLoad("dispatch-threads.json", {});
@@ -2021,9 +2021,9 @@ async function createLinearIssue(title, description) {
   if (!process.env.LINEAR_API_KEY?.trim() || !teamId) { console.warn("[dispatch] LINEAR_API_KEY/TEAM_ID missing"); return null; }
   const labelId = await ensureLinearLabel(dispatchLabel());
   const assigneeId = await linearLeoUserId();
-  // Create directly in Todo: the human already approved in the Slack thread, and
-  // Leo only dispatches from Todo onwards (Backlog is the parked/no-touch zone).
-  const todoState = await linearStateByName(process.env.DISPATCH_CREATE_STATE?.trim() || "Todo");
+  // Create in Backlog: the Slack approval creates the issue, but moving it to
+  // Todo is the human's dispatch trigger (Leo only polls Todo onwards).
+  const todoState = await linearStateByName(process.env.DISPATCH_CREATE_STATE?.trim() || "Backlog");
   const input = {
     teamId, title, description,
     ...(labelId ? { labelIds: [labelId] } : {}),
@@ -2049,18 +2049,83 @@ async function relabelDispatched(issueId) {
   } catch (err) { console.warn(`[dispatch] relabel failed: ${String(err)}`); }
 }
 
+// ---- Full BugSink event detail (stacktrace/tags/breadcrumbs), cached per thread ----
+// Kent is read-only — the WRAPPER reads BugSink and feeds him the whole picture,
+// both when chatting in the thread and when authoring the Linear issue.
+async function fetchBugsinkEventDetail(issueId) {
+  const url = process.env.BUGSINK_URL?.trim();
+  const token = process.env.BUGSINK_API_TOKEN?.trim();
+  if (!url || !token || !issueId) return null;
+  const base = url.replace(/\/$/, "");
+  const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  try {
+    const listRes = await fetch(`${base}/api/canonical/0/events/?issue=${encodeURIComponent(issueId)}`, { headers });
+    if (!listRes.ok) return null;
+    const results = (await listRes.json())?.results || [];
+    const evId = results.length ? results[results.length - 1].id || results[0].id : null;
+    if (!evId) return null;
+    const evRes = await fetch(`${base}/api/canonical/0/events/${encodeURIComponent(evId)}/`, { headers });
+    if (!evRes.ok) return null;
+    const data = (await evRes.json())?.data || {};
+    const tags = normalizeTags(data.tags);
+    const lines = [];
+    lines.push(`environment: ${data.environment || tags.environment || "?"}  source: ${tags.source || tags.server_name || data.platform || "?"}`);
+    if (data.transaction || tags.function) lines.push(`route/function: ${data.transaction || tags.function}`);
+    if (data.request?.url) lines.push(`url: ${String(data.request.url)}`);
+    if (data.logentry?.formatted || data.message) lines.push(`message: ${String(data.logentry?.formatted || data.message).slice(0, 400)}`);
+    for (const ex of (data.exception?.values || []).slice(-2)) {
+      lines.push(`exception: ${ex.type || "?"}: ${String(ex.value || "").slice(0, 300)}`);
+      for (const f of (ex.stacktrace?.frames || []).slice(-8)) {
+        lines.push(`  at ${f.function || "?"} (${f.filename || f.abs_path || "?"}:${f.lineno ?? "?"})`);
+      }
+    }
+    const bc = data.breadcrumbs?.values || [];
+    if (bc.length) {
+      lines.push("breadcrumbs (sista 5):");
+      for (const b of bc.slice(-5)) lines.push(`  [${b.category || b.type || "-"}] ${String(b.message || JSON.stringify(b.data || {})).slice(0, 140)}`);
+    }
+    return redactSensitive(lines.join("\n")).slice(0, 3500);
+  } catch (err) {
+    console.warn(`[dispatch] bugsink detail fetch failed: ${String(err)}`);
+    return null;
+  }
+}
+async function ensureBugsinkContext(rec) {
+  if (rec.context?.bugsink) return rec.context.bugsink;
+  const id = (String(rec.context?.summary || "").match(/issues\/issue\/([0-9a-f-]{36})/i) || [])[1];
+  if (!id) return null;
+  const detail = await fetchBugsinkEventDetail(id);
+  if (detail) { rec.context = rec.context || {}; rec.context.bugsink = detail; }
+  return detail;
+}
+
 // ---- Kent authors a Linear issue (read-only agent; wrapper does the write) ----
-async function kentAuthorIssue(context) {
+// He gets the FULL BugSink event + the open-issue list, and must answer
+// <<<EXISTING>>> if the incident is already covered — no duplicates.
+async function kentAuthorIssue(rec) {
   const agent = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
+  const detail = await ensureBugsinkContext(rec);
+  const open = await fetchLinearOpenIssues();
+  const openList = open.length ? open.map((i) => `- ${i.identifier}: ${i.title}`).join("\n") : "(inga öppna issues hämtade)";
   const prompt = [
-    "En människa har godkänt att skapa en Linear-issue för följande BugSink-incident:",
+    "En människa har godkänt åtgärd för följande BugSink-incident.",
     "",
-    String(context?.summary || JSON.stringify(context || {})).slice(0, 2500),
+    "Incident (Slack-meddelandet):",
+    String(rec.context?.summary || "(saknas)").slice(0, 2200),
     "",
-    "Du är Kent. Författa EN Linear-issue på svenska för Leo att dispatcha.",
-    "Inkludera: vad felet är, var (källa/route), BugSink-länken EXAKT, och en kort föreslagen åtgärd.",
+    detail ? `Fullständig BugSink-detalj (senaste eventet):\n${detail}` : "(ingen BugSink-detalj kunde hämtas)",
+    "",
+    "Öppna Linear-issues just nu:",
+    openList,
+    "",
+    "Du är Kent. FÖRST: avgör om incidenten redan täcks av en öppen issue ovan.",
+    "Om JA — svara EXAKT så här och inget annat:",
+    "<<<EXISTING>>>",
+    "<identifier, t.ex. AHO-1234>",
+    "<<<END>>>",
+    "Om NEJ — författa EN ny Linear-issue på svenska för Leo att dispatcha:",
+    "vad felet är, var (källa/route), BugSink-länken EXAKT, stacktrace-essensen, och en kort föreslagen åtgärd.",
     "Inkludera ALDRIG PII / e-post / tokens / nycklar / kunddata.",
-    "Svara EXAKT i detta format och inget annat:",
     "<<<TITLE>>>",
     "<kort titel>",
     "<<<BODY>>>",
@@ -2072,8 +2137,13 @@ async function kentAuthorIssue(context) {
     const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agent, "--message", prompt]), { timeoutMs: 180_000 });
     out = r.output || "";
   } catch (err) { console.warn(`[dispatch] Kent author failed: ${String(err)}`); return null; }
+  const ex = out.match(/<<<EXISTING>>>([\s\S]*?)<<<END>>>/);
+  if (ex) {
+    const identifier = (ex[1].match(/[A-Z]+-\d+/) || [])[0];
+    if (identifier) return { existing: identifier };
+  }
   const m = out.match(/<<<TITLE>>>([\s\S]*?)<<<BODY>>>([\s\S]*?)<<<END>>>/);
-  if (!m) { console.warn("[dispatch] Kent reply had no TITLE/BODY markers"); return null; }
+  if (!m) { console.warn("[dispatch] Kent reply had no TITLE/BODY/EXISTING markers"); return null; }
   const title = redactSensitive(m[1].trim()).slice(0, 250);
   const body = redactSensitive(m[2].trim()).slice(0, 6000);
   return title ? { title, body } : null;
@@ -2092,10 +2162,15 @@ async function fetchThreadState(rec) {
     messages: cr?.ok ? cr.messages || [] : [],
   };
 }
+// A thumbs-up in ANY form approves: a reaction whose name matches the configured
+// list or contains "thumbsup", OR a thread message that is/contains 👍 / :+1: /
+// :thumbsup*: — people use custom emoji like :thumbsup_all: as messages too.
+const THUMB_MSG_RE = /👍|:\+1:|:thumbsup[a-z_]*:/i;
 function findApproval(state, rec, opts) {
   const allowed = (uid) => uid && uid !== opts.botId && (opts.approvers.length === 0 || opts.approvers.includes(uid));
   for (const re of state.reactions) {
-    if (re.name === opts.reaction) {
+    const name = String(re.name || "").toLowerCase();
+    if (opts.reactions.includes(name) || name.includes("thumbsup")) {
       const by = (re.users || []).find(allowed);
       if (by) return { by, via: "reaction" };
     }
@@ -2103,7 +2178,9 @@ function findApproval(state, rec, opts) {
   for (const msg of state.messages) {
     if (msg.ts === rec.ts || msg.bot_id || !allowed(msg.user)) continue;
     const txt = String(msg.text || "").toLowerCase();
-    if (opts.keywords.some((k) => txt.includes(k))) return { by: msg.user, via: "reply", ts: msg.ts };
+    if (opts.keywords.some((k) => txt.includes(k)) || THUMB_MSG_RE.test(txt)) {
+      return { by: msg.user, via: "reply", ts: msg.ts };
+    }
   }
   return null;
 }
@@ -2113,16 +2190,19 @@ function findApproval(state, rec, opts) {
 async function kentThreadReply(rec, question) {
   const agent = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
   const sessionKey = `agent:${agent}:incident-${String(rec.ts).replace(/\./g, "-")}`;
+  const detail = await ensureBugsinkContext(rec);
   const prompt = [
     "Du är Kent, drift-agent, och svarar i en Slack-incident-tråd. Svara på REN SVENSKA, kort och konkret.",
     "",
     "Incident-kontext:",
     String(rec.context?.summary || "(saknas)").slice(0, 2200),
     "",
+    detail ? `Fullständig BugSink-detalj (senaste eventet):\n${detail}` : "(ingen BugSink-detalj kunde hämtas)",
+    "",
     `Människans meddelande i tråden: ${String(question || "").slice(0, 1500)}`,
     "",
-    "Du kan INTE själv läsa BugSink/köra verktyg — svara utifrån kontexten ovan och säg ärligt om något inte framgår.",
-    "Om människan vill gå vidare med en fix: påminn om att 👍:a incidenten eller svara 'skapa' så skapas en Linear-issue och Leo dispatchar.",
+    "Svara utifrån kontexten ovan — säg ärligt om något inte framgår av den.",
+    "Om människan vill gå vidare med en fix: påminn om att 👍:a eller svara 'skapa' — då skapas en Linear-issue i Backlog; flytta den till Todo så dispatchar Leo.",
     "Inkludera ALDRIG PII / e-post / tokens / nycklar / kunddata.",
     "Svara EXAKT i detta format och inget annat:",
     "<<<REPLY>>>",
@@ -2173,7 +2253,7 @@ async function pollSlackApprovals() {
   const threads = dispLoad("dispatch-threads.json", {});
   const opts = {
     keywords: (process.env.DISPATCH_APPROVE_KEYWORDS || "skapa,go,ja,kör,approve,dispatch").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
-    reaction: (process.env.DISPATCH_APPROVE_REACTION || "+1").replace(/:/g, "").trim(),
+    reactions: (process.env.DISPATCH_APPROVE_REACTION || "+1,thumbsup,thumbsup_all").split(",").map((s) => s.replace(/:/g, "").trim().toLowerCase()).filter(Boolean),
     approvers: (process.env.DISPATCH_APPROVERS || "").split(",").map((s) => s.trim()).filter(Boolean),
     botId: await slackBotUserId(),
   };
@@ -2197,16 +2277,27 @@ async function pollSlackApprovals() {
             rec.answered.push(msg.ts);
           }
         }
-        const authored = await kentAuthorIssue(rec.context);
+        const authored = await kentAuthorIssue(rec);
         if (!authored) {
           await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: ts, text: "⚠️ Kunde inte författa Linear-issue (Kent gav inget svar)." });
+        } else if (authored.existing) {
+          // Incident already covered by an open issue — link it, never duplicate.
+          const match = (await fetchLinearOpenIssues()).find((i) => i.identifier === authored.existing);
+          if (match?.id) {
+            await linearAddComment(match.id, `🤖 Ny BugSink-förekomst kopplad till denna issue (från incident-tråd i Slack):\n\n${String(rec.context?.summary || "").slice(0, 1500)}`);
+          }
+          rec.approved = true; rec.issue = authored.existing;
+          await slackCall("chat.postMessage", {
+            channel: rec.channel, thread_ts: ts,
+            text: `↪️ Matchar befintlig ${authored.existing}${match?.url ? ` (${match.url})` : ""} — ingen ny issue skapades. Flytta den till **Todo** om Leo ska dispatcha den.`,
+          });
         } else {
           const created = await createLinearIssue(authored.title, authored.body);
           rec.approved = true; rec.issue = created?.identifier || null;
           await slackCall("chat.postMessage", {
             channel: rec.channel, thread_ts: ts,
             text: created?.identifier
-              ? `✅ Skapade ${created.identifier} (label \`${dispatchLabel()}\`) för Leo: ${created.url}`
+              ? `✅ Skapade ${created.identifier} i **Backlog** (label \`${dispatchLabel()}\`, assignad Leo): ${created.url}\nFlytta den till **Todo** så dispatchar Leo.`
               : "⚠️ Kunde inte skapa Linear-issue (se loggar).",
           });
         }
