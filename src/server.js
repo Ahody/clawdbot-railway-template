@@ -2021,10 +2021,14 @@ async function createLinearIssue(title, description) {
   if (!process.env.LINEAR_API_KEY?.trim() || !teamId) { console.warn("[dispatch] LINEAR_API_KEY/TEAM_ID missing"); return null; }
   const labelId = await ensureLinearLabel(dispatchLabel());
   const assigneeId = await linearLeoUserId();
+  // Create directly in Todo: the human already approved in the Slack thread, and
+  // Leo only dispatches from Todo onwards (Backlog is the parked/no-touch zone).
+  const todoState = await linearStateByName(process.env.DISPATCH_CREATE_STATE?.trim() || "Todo");
   const input = {
     teamId, title, description,
     ...(labelId ? { labelIds: [labelId] } : {}),
     ...(assigneeId ? { assigneeId } : {}),
+    ...(todoState ? { stateId: todoState.id } : {}),
   };
   const data = await linearGql(`mutation($input:IssueCreateInput!){ issueCreate(input:$input){ issue{ id identifier url } } }`, { input });
   const issue = data?.issueCreate?.issue;
@@ -2246,9 +2250,10 @@ async function pollLinearForDispatch() {
     ? `{ or: [ { labels:{ some:{ name:{ eq:$label } } } }, { assignee:{ id:{ eq:"${leoId}" } } } ] }`
     : `{ labels:{ some:{ name:{ eq:$label } } } }`;
 
-  // ── Phase 1: dispatch anything in Backlog/Todo ────────────────────────────
+  // ── Phase 1: dispatch from Todo onwards — NOT Backlog (parked/no-touch zone;
+  // move an issue to Todo to greenlight it for Leo) ──────────────────────────
   const d1 = await linearGql(
-    `query($teamId:String!,$label:String!){ team(id:$teamId){ issues(first:25, filter:{ and:[ ${orFilter}, { state:{ type:{ in:["backlog","unstarted"] } } } ] }){ nodes{ id identifier title description url } } } }`,
+    `query($teamId:String!,$label:String!){ team(id:$teamId){ issues(first:25, filter:{ and:[ ${orFilter}, { state:{ type:{ in:["unstarted"] } } } ] }){ nodes{ id identifier title description url } } } }`,
     { teamId, label },
   );
   const todo = d1?.team?.issues?.nodes || [];
