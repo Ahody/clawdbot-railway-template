@@ -1833,13 +1833,10 @@ async function pollBugsinkOnce() {
   const slackMsg = (m ? m[1] : "").trim();
   if (!slackMsg) { console.log("[bugsink-poll] empty triage message, skipping"); return; }
 
-  try {
-    // NOTE: verify flags against `openclaw message send --help`.
-    await runCmd(OPENCLAW_NODE, clawArgs(["message", "send", "--channel", "slack", "--target", target, "--message", slackMsg]), { timeoutMs: 60_000 });
-    console.log("[bugsink-poll] incident posted to Slack");
-  } catch (err) {
-    console.warn(`[bugsink-poll] slack send failed: ${String(err)}`);
-  }
+  // Post the incident. When DISPATCH_ENABLED, this goes via the Slack API so we
+  // capture the thread ts and watch it for a human approval (👍 / keyword) that
+  // lets Kent author a Linear issue for Leo. Otherwise it sends as before.
+  await postIncidentToSlack(slackMsg, { summary: slackMsg });
 }
 
 function startBugsinkPoller() {
@@ -1849,6 +1846,283 @@ function startBugsinkPoller() {
   setTimeout(() => pollBugsinkOnce().catch((e) => console.warn("[bugsink-poll]", String(e))), 30_000);
   const t = setInterval(() => pollBugsinkOnce().catch((e) => console.warn("[bugsink-poll]", String(e))), interval);
   t.unref?.();
+}
+
+// ===========================================================================
+// Dispatch flow (AHO): Kent triage → human Slack-approval → Kent authors a
+// Linear issue (wrapper writes; Kent stays read-only) → Leo polls Linear →
+// Leo sessions_send → EVA (full-tools coder) implements + opens a PR.
+// All gated behind DISPATCH_ENABLED=true. Off by default → deploy is inert.
+//
+// Env:
+//   DISPATCH_ENABLED=true            master switch
+//   SLACK_BOT_TOKEN                  (else read from channels.slack.botToken)
+//   INCIDENT_SLACK_TARGET            channel:C0XXXXXXX  (reused from poller)
+//   DISPATCH_APPROVERS               csv Slack user ids allowed to approve (empty = any human)
+//   DISPATCH_APPROVE_KEYWORDS        csv reply keywords (default: skapa,go,ja,kör,approve,dispatch)
+//   DISPATCH_APPROVE_REACTION        reaction name (default: +1 → 👍)
+//   DISPATCH_LABEL                   Linear label for new issues (default: agent-dispatch)
+//   LEO_AGENT / WORKER_AGENT         agent ids (default: leo / eva)
+//   DISPATCH_SLACK_POLL_MS / DISPATCH_LINEAR_POLL_MS
+//   LINEAR_API_KEY / LINEAR_TEAM_ID  (reused from poller)
+// ===========================================================================
+
+const dispatchEnabled = () => String(process.env.DISPATCH_ENABLED || "").toLowerCase() === "true";
+const dispatchLabel = () => process.env.DISPATCH_LABEL?.trim() || "agent-dispatch";
+
+function dispLoad(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(path.join(STATE_DIR, file), "utf8")); } catch { return fallback; }
+}
+function dispSave(file, data) {
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.writeFileSync(path.join(STATE_DIR, file), JSON.stringify(data)); } catch {}
+}
+
+// ---- Slack Web API (bot token from env or openclaw config) ----
+let _slackToken;
+function slackToken() {
+  if (_slackToken !== undefined) return _slackToken;
+  let t = process.env.SLACK_BOT_TOKEN?.trim();
+  if (!t) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(configPath(), "utf8"));
+      t = cfg?.channels?.slack?.botToken || cfg?.channels?.slack?.bot_token;
+    } catch {}
+  }
+  _slackToken = t || null;
+  return _slackToken;
+}
+function slackChannelId() {
+  const m = (process.env.INCIDENT_SLACK_TARGET || "").trim().match(/(?:channel:)?([A-Z0-9]{8,})/i);
+  return m ? m[1] : null;
+}
+async function slackCall(method, params = {}) {
+  const token = slackToken();
+  if (!token) return { ok: false, error: "no_slack_token" };
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v != null) body.set(k, String(v));
+  try {
+    const res = await fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    return await res.json();
+  } catch (err) { return { ok: false, error: String(err) }; }
+}
+let _botUserId;
+async function slackBotUserId() {
+  if (_botUserId !== undefined) return _botUserId;
+  const r = await slackCall("auth.test");
+  _botUserId = r?.ok ? r.user_id : null;
+  return _botUserId;
+}
+
+// Post an incident. When dispatch is on, go via Slack API so we capture the
+// thread ts to watch for approval; otherwise fall back to `openclaw message send`.
+async function postIncidentToSlack(text, context) {
+  const target = process.env.INCIDENT_SLACK_TARGET?.trim();
+  const channel = slackChannelId();
+  if (dispatchEnabled() && slackToken() && channel) {
+    const kw = (process.env.DISPATCH_APPROVE_KEYWORDS || "skapa,go,ja,kör,approve,dispatch").split(",")[0].trim();
+    const hint = `\n\n_👍 eller svara "${kw}" i tråden för att skapa Linear-issue + dispatcha Leo._`;
+    const r = await slackCall("chat.postMessage", { channel, text: text + hint });
+    if (r?.ok && r.ts) {
+      const threads = dispLoad("dispatch-threads.json", {});
+      threads[r.ts] = { channel, ts: r.ts, postedAt: Date.now(), approved: false, context };
+      dispSave("dispatch-threads.json", threads);
+      console.log(`[dispatch] incident posted (ts=${r.ts}); awaiting Slack approval`);
+      return;
+    }
+    console.warn(`[dispatch] chat.postMessage failed (${JSON.stringify(r).slice(0, 160)}); falling back to openclaw send`);
+  }
+  try {
+    await runCmd(OPENCLAW_NODE, clawArgs(["message", "send", "--channel", "slack", "--target", target, "--message", text]), { timeoutMs: 60_000 });
+    console.log("[bugsink-poll] incident posted to Slack");
+  } catch (err) { console.warn(`[bugsink-poll] slack send failed: ${String(err)}`); }
+}
+
+// ---- Linear GraphQL (read + write) ----
+async function linearGql(query, variables) {
+  const key = process.env.LINEAR_API_KEY?.trim();
+  if (!key) return null;
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: key },
+      body: JSON.stringify({ query, variables }),
+    });
+    if (!res.ok) { console.warn(`[dispatch] Linear HTTP ${res.status}`); return null; }
+    const data = await res.json();
+    if (data?.errors) { console.warn(`[dispatch] Linear errors: ${JSON.stringify(data.errors).slice(0, 300)}`); return null; }
+    return data?.data || null;
+  } catch (err) { console.warn(`[dispatch] Linear fetch failed: ${String(err)}`); return null; }
+}
+const _labelIdCache = {};
+async function ensureLinearLabel(name) {
+  if (_labelIdCache[name]) return _labelIdCache[name];
+  const teamId = process.env.LINEAR_TEAM_ID?.trim();
+  if (!teamId) return null;
+  const found = await linearGql(`query($teamId:String!){ team(id:$teamId){ labels(first:200){ nodes{ id name } } } }`, { teamId });
+  const existing = (found?.team?.labels?.nodes || []).find((l) => l.name.toLowerCase() === name.toLowerCase());
+  if (existing) return (_labelIdCache[name] = existing.id);
+  const created = await linearGql(`mutation($teamId:String!,$name:String!){ issueLabelCreate(input:{teamId:$teamId,name:$name}){ issueLabel{ id } } }`, { teamId, name });
+  const id = created?.issueLabelCreate?.issueLabel?.id || null;
+  if (id) _labelIdCache[name] = id;
+  return id;
+}
+async function createLinearIssue(title, description) {
+  const teamId = process.env.LINEAR_TEAM_ID?.trim();
+  if (!process.env.LINEAR_API_KEY?.trim() || !teamId) { console.warn("[dispatch] LINEAR_API_KEY/TEAM_ID missing"); return null; }
+  const labelId = await ensureLinearLabel(dispatchLabel());
+  const input = { teamId, title, description, ...(labelId ? { labelIds: [labelId] } : {}) };
+  const data = await linearGql(`mutation($input:IssueCreateInput!){ issueCreate(input:$input){ issue{ id identifier url } } }`, { input });
+  const issue = data?.issueCreate?.issue;
+  return issue ? { id: issue.id, identifier: issue.identifier, url: issue.url } : null;
+}
+async function linearAddComment(issueId, body) {
+  await linearGql(`mutation($id:String!,$body:String!){ commentCreate(input:{issueId:$id, body:$body}){ success } }`, { id: issueId, body });
+}
+async function relabelDispatched(issueId) {
+  try {
+    const fromId = await ensureLinearLabel(dispatchLabel());
+    const toId = await ensureLinearLabel("agent-dispatched");
+    const cur = await linearGql(`query($id:String!){ issue(id:$id){ labels{ nodes{ id } } } }`, { id: issueId });
+    const ids = new Set((cur?.issue?.labels?.nodes || []).map((n) => n.id));
+    if (fromId) ids.delete(fromId);
+    if (toId) ids.add(toId);
+    await linearGql(`mutation($id:String!,$ids:[String!]){ issueUpdate(id:$id, input:{labelIds:$ids}){ success } }`, { id: issueId, ids: [...ids] });
+  } catch (err) { console.warn(`[dispatch] relabel failed: ${String(err)}`); }
+}
+
+// ---- Kent authors a Linear issue (read-only agent; wrapper does the write) ----
+async function kentAuthorIssue(context) {
+  const agent = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
+  const prompt = [
+    "En människa har godkänt att skapa en Linear-issue för följande BugSink-incident:",
+    "",
+    String(context?.summary || JSON.stringify(context || {})).slice(0, 2500),
+    "",
+    "Du är Kent. Författa EN Linear-issue på svenska för Leo att dispatcha.",
+    "Inkludera: vad felet är, var (källa/route), BugSink-länken EXAKT, och en kort föreslagen åtgärd.",
+    "Inkludera ALDRIG PII / e-post / tokens / nycklar / kunddata.",
+    "Svara EXAKT i detta format och inget annat:",
+    "<<<TITLE>>>",
+    "<kort titel>",
+    "<<<BODY>>>",
+    "<beskrivning i markdown>",
+    "<<<END>>>",
+  ].join("\n");
+  let out = "";
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agent, "--message", prompt]), { timeoutMs: 180_000 });
+    out = r.output || "";
+  } catch (err) { console.warn(`[dispatch] Kent author failed: ${String(err)}`); return null; }
+  const m = out.match(/<<<TITLE>>>([\s\S]*?)<<<BODY>>>([\s\S]*?)<<<END>>>/);
+  if (!m) { console.warn("[dispatch] Kent reply had no TITLE/BODY markers"); return null; }
+  const title = redactSensitive(m[1].trim()).slice(0, 250);
+  const body = redactSensitive(m[2].trim()).slice(0, 6000);
+  return title ? { title, body } : null;
+}
+
+// ---- Poll watched Slack threads for human approval (👍 or keyword reply) ----
+async function checkThreadApproval(rec, opts) {
+  const allowed = (uid) => uid && uid !== opts.botId && (opts.approvers.length === 0 || opts.approvers.includes(uid));
+  const rr = await slackCall("reactions.get", { channel: rec.channel, timestamp: rec.ts });
+  for (const re of (rr?.ok ? rr.message?.reactions || [] : [])) {
+    if (re.name === opts.reaction) {
+      const by = (re.users || []).find(allowed);
+      if (by) return { by, via: "reaction" };
+    }
+  }
+  const cr = await slackCall("conversations.replies", { channel: rec.channel, ts: rec.ts, limit: 50 });
+  for (const msg of (cr?.ok ? cr.messages || [] : [])) {
+    if (msg.ts === rec.ts || msg.bot_id || !allowed(msg.user)) continue;
+    const txt = String(msg.text || "").toLowerCase();
+    if (opts.keywords.some((k) => txt.includes(k))) return { by: msg.user, via: "reply" };
+  }
+  return null;
+}
+async function pollSlackApprovals() {
+  if (!dispatchEnabled() || !slackToken()) return;
+  const threads = dispLoad("dispatch-threads.json", {});
+  const opts = {
+    keywords: (process.env.DISPATCH_APPROVE_KEYWORDS || "skapa,go,ja,kör,approve,dispatch").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+    reaction: (process.env.DISPATCH_APPROVE_REACTION || "+1").replace(/:/g, "").trim(),
+    approvers: (process.env.DISPATCH_APPROVERS || "").split(",").map((s) => s.trim()).filter(Boolean),
+    botId: await slackBotUserId(),
+  };
+  const TTL = 48 * 3600 * 1000;
+  let changed = false;
+  for (const [ts, rec] of Object.entries(threads)) {
+    if (rec.approved) continue;
+    if (Date.now() - (rec.postedAt || 0) > TTL) { delete threads[ts]; changed = true; continue; }
+    const approval = await checkThreadApproval(rec, opts);
+    if (!approval) continue;
+    console.log(`[dispatch] approval on ts=${ts} via ${approval.via} by ${approval.by}`);
+    const authored = await kentAuthorIssue(rec.context);
+    if (!authored) {
+      await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: ts, text: "⚠️ Kunde inte författa Linear-issue (Kent gav inget svar)." });
+      continue;
+    }
+    const created = await createLinearIssue(authored.title, authored.body);
+    rec.approved = true; rec.issue = created?.identifier || null; changed = true;
+    await slackCall("chat.postMessage", {
+      channel: rec.channel, thread_ts: ts,
+      text: created?.identifier
+        ? `✅ Skapade ${created.identifier} (label \`${dispatchLabel()}\`) för Leo: ${created.url}`
+        : "⚠️ Kunde inte skapa Linear-issue (se loggar).",
+    });
+  }
+  if (changed) dispSave("dispatch-threads.json", threads);
+}
+
+// ---- Poll Linear for dispatch-labelled issues → Leo dispatches a worker ----
+async function pollLinearForDispatch() {
+  if (!dispatchEnabled()) return;
+  const teamId = process.env.LINEAR_TEAM_ID?.trim();
+  if (!teamId || !process.env.LINEAR_API_KEY?.trim()) return;
+  const label = dispatchLabel();
+  const data = await linearGql(
+    `query($teamId:String!,$label:String!){ team(id:$teamId){ issues(first:25, filter:{ labels:{ some:{ name:{ eq:$label } } }, state:{ type:{ nin:["completed","canceled"] } } }){ nodes{ id identifier title description url } } } }`,
+    { teamId, label },
+  );
+  const issues = data?.team?.issues?.nodes || [];
+  if (!issues.length) return;
+  const seen = new Set(dispLoad("dispatch-seen-issues.json", []));
+  const leo = process.env.LEO_AGENT?.trim() || "leo";
+  const worker = process.env.WORKER_AGENT?.trim() || "eva";
+  let changed = false;
+  for (const iss of issues) {
+    if (seen.has(iss.id)) continue;
+    const prompt = [
+      `Ny dispatch-issue från Kent: ${iss.identifier} — ${iss.title}`,
+      iss.url,
+      "",
+      String(iss.description || "").slice(0, 3000),
+      "",
+      `Du är Leo (dispatch-only). Dispatcha en worker: be agenten "${worker}" implementera fixen på en branch \`agent/${iss.identifier}-<slug>\` och öppna en PR mot \`staging\` med titeln som börjar "${iss.identifier}: ...".`,
+      "Du mergar ALDRIG och pushar ALDRIG till staging/main/dev — människor är merge-grinden. Bekräfta kort vad du dispatchade.",
+    ].join("\n");
+    console.log(`[dispatch] Leo dispatching ${iss.identifier} → ${worker}`);
+    try {
+      await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", leo, "--message", prompt]), { timeoutMs: 240_000 });
+    } catch (err) { console.warn(`[dispatch] Leo dispatch failed for ${iss.identifier}: ${String(err)}`); continue; }
+    seen.add(iss.id); changed = true;
+    await relabelDispatched(iss.id);
+    await linearAddComment(iss.id, `🤖 Leo dispatchade \`${worker}\` att implementera detta och öppna en PR mot staging.`);
+  }
+  if (changed) dispSave("dispatch-seen-issues.json", [...seen]);
+}
+
+function startDispatchPollers() {
+  if (!dispatchEnabled()) { console.log("[wrapper] dispatch flow disabled (set DISPATCH_ENABLED=true to enable)"); return; }
+  const slackMs = Number.parseInt(process.env.DISPATCH_SLACK_POLL_MS ?? "60000", 10) || 60_000;
+  const linMs = Number.parseInt(process.env.DISPATCH_LINEAR_POLL_MS ?? "120000", 10) || 120_000;
+  console.log(`[wrapper] dispatch flow ENABLED (approvals every ${Math.round(slackMs / 1000)}s, dispatch every ${Math.round(linMs / 1000)}s)`);
+  setTimeout(() => pollSlackApprovals().catch((e) => console.warn("[dispatch-slack]", String(e))), 45_000);
+  const t1 = setInterval(() => pollSlackApprovals().catch((e) => console.warn("[dispatch-slack]", String(e))), slackMs);
+  const t2 = setInterval(() => pollLinearForDispatch().catch((e) => console.warn("[dispatch-linear]", String(e))), linMs);
+  t1.unref?.(); t2.unref?.();
 }
 
 const server = app.listen(PORT, "0.0.0.0", async () => {
@@ -1928,6 +2202,14 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     startBugsinkPoller();
   } catch (err) {
     console.warn(`[wrapper] BugSink poller failed to start (continuing): ${String(err)}`);
+  }
+
+  // Start the dispatch pollers (Slack-approval → Kent authors issue; Leo → worker).
+  // No-op unless DISPATCH_ENABLED=true.
+  try {
+    startDispatchPollers();
+  } catch (err) {
+    console.warn(`[wrapper] dispatch pollers failed to start (continuing): ${String(err)}`);
   }
 
   // Ensure the logs-ingest table exists (no-op unless LOGS_DB_WRITE_URL is set).
