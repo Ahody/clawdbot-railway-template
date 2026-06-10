@@ -2356,6 +2356,11 @@ async function _pollLinearForDispatchInner() {
   );
   const todo = d1?.team?.issues?.nodes || [];
   const seen = new Set(dispLoad("dispatch-seen-issues.json", []));
+  // Heartbeat: always prove the poll ran and what it saw (silence was unreadable).
+  console.log(
+    `[dispatch] linear poll: ${todo.length} Todo-match (label="${label}" or assignee leo=${leoId ? "ok" : "UNRESOLVED"}), ` +
+    `${todo.filter((i) => seen.has(i.id)).length} blocked by seen-file`,
+  );
   for (const iss of todo) {
     if (seen.has(iss.id)) continue;
     // Mark seen up front so an overlapping poll can never double-dispatch.
