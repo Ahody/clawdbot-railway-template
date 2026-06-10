@@ -2450,9 +2450,32 @@ async function _pollLinearForDispatchInner() {
       "",
       "Du får ALDRIG merga och ALDRIG pusha direkt till staging/main/dev — människor är merge-grinden.",
       "Om ett steg failar: visa exakta felet och försök rimliga alternativ innan du ger upp — rapportera aldrig 'saknar åtkomst' utan att ha kört kommandot.",
+      "PR-länken du rapporterar VERIFIERAS MASKINELLT mot GitHub-API:t. En påhittad länk upptäcks alltid och räknas som misslyckad körning. Visa rå output från gh pr create.",
     ].join("\n");
     const evaTimeoutMs = Number.parseInt(process.env.WORKER_TIMEOUT_MS ?? "1800000", 10) || 1_800_000;
     const maxTurns = Number.parseInt(process.env.WORKER_MAX_TURNS ?? "4", 10) || 4;
+
+    // Trust nothing: a reported PR link is only accepted after the GitHub API
+    // confirms it exists (her first "success" was a fabricated #1224 in 34s).
+    const mintGithubToken = async () => {
+      try {
+        const r = await runCmd(OPENCLAW_NODE, [helperPath, "--token"], { timeoutMs: 30_000 });
+        const t = (r.output || "").trim().split(/\s+/).pop();
+        return r.code === 0 && t && t.length > 20 ? t : null;
+      } catch { return null; }
+    };
+    const verifyPrExists = async (url) => {
+      const m = String(url).match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+      if (!m) return false;
+      const token = await mintGithubToken();
+      if (!token) { console.warn("[dispatch] could not mint token to verify PR — accepting unverified"); return true; }
+      try {
+        const res = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "ahody-wrapper" },
+        });
+        return res.ok;
+      } catch { return true; } // network hiccup → don't fail the run on the verifier
+    };
     console.log(`[dispatch] ${iss.identifier}: running ${worker} (timeout ${Math.round(evaTimeoutMs / 60000)} min/turn, max ${maxTurns} turns)`);
     // Chat models love ending a turn with "say 'continue' and I'll do it" — in a
     // headless run nobody answers, so the wrapper IS the answer: keep replying
@@ -2468,20 +2491,34 @@ async function _pollLinearForDispatchInner() {
     // she was in a broken state and she answered in seconds without tool calls.
     const sessionKey = `agent:${worker}:task-${iss.identifier.toLowerCase()}-${Date.now()}`;
     try {
+      let correction = "";
       for (let turn = 0; turn < maxTurns && !prUrl; turn++) {
+        const msg = turn === 0 ? task : (correction || continueMsg);
+        correction = "";
         const r = await runCmd(
           OPENCLAW_NODE,
-          clawArgs(["agent", "--agent", worker, "--session-key", sessionKey, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", turn === 0 ? task : continueMsg]),
+          clawArgs(["agent", "--agent", worker, "--session-key", sessionKey, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", msg]),
           { timeoutMs: evaTimeoutMs + 60_000 },
         );
         lastOut = r.output || "";
-        prUrl = (lastOut.match(/https:\/\/github\.com\/[^\s)"']+\/pull\/\d+/) || [])[0] || null;
+        const candidate = (lastOut.match(/https:\/\/github\.com\/[^\s)"']+\/pull\/\d+/) || [])[0] || null;
+        if (candidate) {
+          if (await verifyPrExists(candidate)) {
+            prUrl = candidate;
+          } else {
+            console.warn(`[dispatch] ${iss.identifier}: reported PR does not exist (${candidate}) — fabricated`);
+            correction =
+              `Länken ${candidate} FINNS INTE på GitHub — den var påhittad. Påhittade resultat är förbjudna och avslöjas maskinellt. ` +
+              "Gör arbetet PÅ RIKTIGT med dina verktyg: kör varje kommando via exec och visa dess RÅA output " +
+              "(git clone/checkout, ändringarna, git push, gh pr create). Avsluta med den riktiga PR-länken — den verifieras mot GitHub-API:t.";
+          }
+        }
         if (r.code !== 0 && !prUrl) {
           console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code} (turn ${turn + 1})`);
           await linearAddComment(iss.id, `⚠️ ${worker}-körningen avslutades med fel (exit ${r.code}, tur ${turn + 1}) — ingen PR garanterad. Se wrapper-loggarna.`);
           break;
         }
-        if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a PR link — auto-continuing`);
+        if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
       }
       if (prUrl) {
         console.log(`[dispatch] ${iss.identifier}: PR opened ${prUrl}`);
