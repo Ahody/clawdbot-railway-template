@@ -2429,6 +2429,7 @@ async function _pollLinearForDispatchInner() {
       "",
       "DETTA ÄR EN HEADLESS KÖRNING: ingen människa läser eller besvarar mellanfrågor.",
       "Att avsluta din tur med en fråga, ett löfte eller 'säg till så kör jag' = misslyckad körning.",
+      "Du startar i en FÄRSK session utan historik — det finns inget tidigare avbrutet arbete. Börja från steg 1.",
       "Kör arbetet KLART i denna tur: verktygsanrop hela vägen till en öppnad PR.",
       "",
       "Arbetsorder från Leo:",
@@ -2462,11 +2463,15 @@ async function _pollLinearForDispatchInner() {
       "Avsluta med PR-länken.";
     let prUrl = null;
     let lastOut = "";
+    // FRESH session per task. Reusing agent:eva:main poisoned every retry: the
+    // history of earlier failed attempts ("körningen avbröts...") convinced her
+    // she was in a broken state and she answered in seconds without tool calls.
+    const sessionKey = `agent:${worker}:task-${iss.identifier.toLowerCase()}-${Date.now()}`;
     try {
       for (let turn = 0; turn < maxTurns && !prUrl; turn++) {
         const r = await runCmd(
           OPENCLAW_NODE,
-          clawArgs(["agent", "--agent", worker, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", turn === 0 ? task : continueMsg]),
+          clawArgs(["agent", "--agent", worker, "--session-key", sessionKey, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", turn === 0 ? task : continueMsg]),
           { timeoutMs: evaTimeoutMs + 60_000 },
         );
         lastOut = r.output || "";
