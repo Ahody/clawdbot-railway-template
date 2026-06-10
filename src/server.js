@@ -1978,11 +1978,54 @@ async function ensureLinearLabel(name) {
   if (id) _labelIdCache[name] = id;
   return id;
 }
+// Resolve the Linear user the agents act as (issues get assigned to "Leo").
+let _leoUserId;
+async function linearLeoUserId() {
+  if (_leoUserId !== undefined) return _leoUserId;
+  const who = process.env.DISPATCH_LEO_LINEAR_USER?.trim() || "leo";
+  const data = await linearGql(
+    `query($q:String!){ users(filter:{ or:[ { name:{ containsIgnoreCase:$q } }, { displayName:{ containsIgnoreCase:$q } }, { email:{ containsIgnoreCase:$q } } ] }){ nodes{ id name displayName } } }`,
+    { q: who },
+  );
+  const nodes = data?.users?.nodes || [];
+  const exact = nodes.find((u) => [u.name, u.displayName].some((n) => String(n || "").toLowerCase() === who.toLowerCase()));
+  _leoUserId = (exact || nodes[0])?.id || null;
+  if (!_leoUserId) console.warn(`[dispatch] no Linear user matching "${who}" — issues won't be assigned`);
+  return _leoUserId;
+}
+
+// Team workflow states (id/name/type), cached. Used for In Progress / review moves.
+let _teamStates;
+async function linearTeamStates() {
+  if (_teamStates) return _teamStates;
+  const teamId = process.env.LINEAR_TEAM_ID?.trim();
+  if (!teamId) return [];
+  const data = await linearGql(`query($teamId:String!){ team(id:$teamId){ states{ nodes{ id name type } } } }`, { teamId });
+  _teamStates = data?.team?.states?.nodes || [];
+  return _teamStates;
+}
+async function linearStateByName(name, fallbackContains) {
+  const states = await linearTeamStates();
+  return (
+    states.find((s) => s.name.toLowerCase() === String(name).toLowerCase()) ||
+    (fallbackContains ? states.find((s) => s.name.toLowerCase().includes(fallbackContains)) : null) ||
+    null
+  );
+}
+async function linearSetState(issueId, stateId) {
+  await linearGql(`mutation($id:String!,$stateId:String!){ issueUpdate(id:$id, input:{ stateId:$stateId }){ success } }`, { id: issueId, stateId });
+}
+
 async function createLinearIssue(title, description) {
   const teamId = process.env.LINEAR_TEAM_ID?.trim();
   if (!process.env.LINEAR_API_KEY?.trim() || !teamId) { console.warn("[dispatch] LINEAR_API_KEY/TEAM_ID missing"); return null; }
   const labelId = await ensureLinearLabel(dispatchLabel());
-  const input = { teamId, title, description, ...(labelId ? { labelIds: [labelId] } : {}) };
+  const assigneeId = await linearLeoUserId();
+  const input = {
+    teamId, title, description,
+    ...(labelId ? { labelIds: [labelId] } : {}),
+    ...(assigneeId ? { assigneeId } : {}),
+  };
   const data = await linearGql(`mutation($input:IssueCreateInput!){ issueCreate(input:$input){ issue{ id identifier url } } }`, { input });
   const issue = data?.issueCreate?.issue;
   return issue ? { id: issue.id, identifier: issue.identifier, url: issue.url } : null;
@@ -2186,26 +2229,35 @@ async function pollSlackApprovals() {
   if (changed) dispSave("dispatch-threads.json", threads);
 }
 
-// ---- Poll Linear for dispatch-labelled issues → Leo dispatches a worker ----
+// ---- Poll Linear: (1) Backlog/Todo → Leo dispatches EVA + issue → In Progress;
+// ---- (2) In Progress issues where EVA's PR exists (GitHub attachment) → In PR review.
+// EVA never merges — humans are the merge gate; Leo owns the status moves.
 async function pollLinearForDispatch() {
   if (!dispatchEnabled()) return;
   const teamId = process.env.LINEAR_TEAM_ID?.trim();
   if (!teamId || !process.env.LINEAR_API_KEY?.trim()) return;
   const label = dispatchLabel();
-  const data = await linearGql(
-    `query($teamId:String!,$label:String!){ team(id:$teamId){ issues(first:25, filter:{ labels:{ some:{ name:{ eq:$label } } }, state:{ type:{ nin:["completed","canceled"] } } }){ nodes{ id identifier title description url } } } }`,
-    { teamId, label },
-  );
-  const issues = data?.team?.issues?.nodes || [];
-  if (!issues.length) return;
-  const seen = new Set(dispLoad("dispatch-seen-issues.json", []));
+  const leoId = await linearLeoUserId();
   const leo = process.env.LEO_AGENT?.trim() || "leo";
   const worker = process.env.WORKER_AGENT?.trim() || "eva";
+
+  // Issues are "Leo's" if they carry the dispatch label OR are assigned to him.
+  const orFilter = leoId
+    ? `{ or: [ { labels:{ some:{ name:{ eq:$label } } } }, { assignee:{ id:{ eq:"${leoId}" } } } ] }`
+    : `{ labels:{ some:{ name:{ eq:$label } } } }`;
+
+  // ── Phase 1: dispatch anything in Backlog/Todo ────────────────────────────
+  const d1 = await linearGql(
+    `query($teamId:String!,$label:String!){ team(id:$teamId){ issues(first:25, filter:{ and:[ ${orFilter}, { state:{ type:{ in:["backlog","unstarted"] } } } ] }){ nodes{ id identifier title description url } } } }`,
+    { teamId, label },
+  );
+  const todo = d1?.team?.issues?.nodes || [];
+  const seen = new Set(dispLoad("dispatch-seen-issues.json", []));
   let changed = false;
-  for (const iss of issues) {
+  for (const iss of todo) {
     if (seen.has(iss.id)) continue;
     const prompt = [
-      `Ny dispatch-issue från Kent: ${iss.identifier} — ${iss.title}`,
+      `Ny dispatch-issue: ${iss.identifier} — ${iss.title}`,
       iss.url,
       "",
       String(iss.description || "").slice(0, 3000),
@@ -2219,9 +2271,34 @@ async function pollLinearForDispatch() {
     } catch (err) { console.warn(`[dispatch] Leo dispatch failed for ${iss.identifier}: ${String(err)}`); continue; }
     seen.add(iss.id); changed = true;
     await relabelDispatched(iss.id);
+    if (leoId) await linearGql(`mutation($id:String!,$a:String!){ issueUpdate(id:$id, input:{ assigneeId:$a }){ success } }`, { id: iss.id, a: leoId });
+    const progress = await linearStateByName(process.env.DISPATCH_PROGRESS_STATE?.trim() || "In Progress");
+    if (progress) await linearSetState(iss.id, progress.id);
     await linearAddComment(iss.id, `🤖 Leo dispatchade \`${worker}\` att implementera detta och öppna en PR mot staging.`);
   }
   if (changed) dispSave("dispatch-seen-issues.json", [...seen]);
+
+  // ── Phase 2: In Progress + EVA's PR linked → move to "In PR review" ──────
+  const reviewName = process.env.DISPATCH_REVIEW_STATE?.trim() || "In PR review";
+  const review = await linearStateByName(reviewName, "review");
+  if (!review) { console.warn(`[dispatch] no team state matching "${reviewName}" (or containing "review") — skipping review moves`); return; }
+  const d2 = await linearGql(
+    `query($teamId:String!,$label:String!){ team(id:$teamId){ issues(first:50, filter:{ and:[ ${orFilter}, { state:{ type:{ in:["started"] } } } ] }){ nodes{ id identifier state{ id name } attachments{ nodes{ url } } } } } }`,
+    { teamId, label },
+  );
+  const started = d2?.team?.issues?.nodes || [];
+  const reviewed = new Set(dispLoad("dispatch-reviewed.json", []));
+  let rchanged = false;
+  for (const iss of started) {
+    if (reviewed.has(iss.id) || iss.state?.id === review.id) continue;
+    const pr = (iss.attachments?.nodes || []).find((a) => /github\.com\/.+\/pull\/\d+/.test(String(a.url || "")));
+    if (!pr) continue; // EVA not done yet — no PR linked
+    console.log(`[dispatch] ${iss.identifier}: PR linked (${pr.url}) → "${review.name}"`);
+    await linearSetState(iss.id, review.id);
+    await linearAddComment(iss.id, `🤖 EVA:s PR är öppnad: ${pr.url} — Leo flyttar till **${review.name}**. Människa reviewar + mergar.`);
+    reviewed.add(iss.id); rchanged = true;
+  }
+  if (rchanged) dispSave("dispatch-reviewed.json", [...reviewed]);
 }
 
 function startDispatchPollers() {
