@@ -2427,6 +2427,10 @@ async function _pollLinearForDispatchInner() {
       `Implementera Linear-issue ${iss.identifier}: ${iss.title}`,
       iss.url,
       "",
+      "DETTA ÄR EN HEADLESS KÖRNING: ingen människa läser eller besvarar mellanfrågor.",
+      "Att avsluta din tur med en fråga, ett löfte eller 'säg till så kör jag' = misslyckad körning.",
+      "Kör arbetet KLART i denna tur: verktygsanrop hela vägen till en öppnad PR.",
+      "",
       "Arbetsorder från Leo:",
       brief || String(iss.description || "").slice(0, 3000),
       "",
@@ -2447,16 +2451,38 @@ async function _pollLinearForDispatchInner() {
       "Om ett steg failar: visa exakta felet och försök rimliga alternativ innan du ger upp — rapportera aldrig 'saknar åtkomst' utan att ha kört kommandot.",
     ].join("\n");
     const evaTimeoutMs = Number.parseInt(process.env.WORKER_TIMEOUT_MS ?? "1800000", 10) || 1_800_000;
-    console.log(`[dispatch] ${iss.identifier}: running ${worker} (timeout ${Math.round(evaTimeoutMs / 60000)} min)`);
+    const maxTurns = Number.parseInt(process.env.WORKER_MAX_TURNS ?? "4", 10) || 4;
+    console.log(`[dispatch] ${iss.identifier}: running ${worker} (timeout ${Math.round(evaTimeoutMs / 60000)} min/turn, max ${maxTurns} turns)`);
+    // Chat models love ending a turn with "say 'continue' and I'll do it" — in a
+    // headless run nobody answers, so the wrapper IS the answer: keep replying
+    // "fortsätt" in the same session until a PR link appears (or turns run out).
+    const continueMsg =
+      "Fortsätt nu. Ingen människa läser detta — kör ALLA steg klart " +
+      "(klona/implementera/committa/pusha/gh pr create) utan att ställa fler frågor. " +
+      "Avsluta med PR-länken.";
+    let prUrl = null;
+    let lastOut = "";
     try {
-      const r = await runCmd(
-        OPENCLAW_NODE,
-        clawArgs(["agent", "--agent", worker, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", task]),
-        { timeoutMs: evaTimeoutMs + 60_000 },
-      );
-      if (r.code !== 0) {
-        console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code}`);
-        await linearAddComment(iss.id, `⚠️ ${worker}-körningen avslutades med fel (exit ${r.code}) — ingen PR garanterad. Se wrapper-loggarna.`);
+      for (let turn = 0; turn < maxTurns && !prUrl; turn++) {
+        const r = await runCmd(
+          OPENCLAW_NODE,
+          clawArgs(["agent", "--agent", worker, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", turn === 0 ? task : continueMsg]),
+          { timeoutMs: evaTimeoutMs + 60_000 },
+        );
+        lastOut = r.output || "";
+        prUrl = (lastOut.match(/https:\/\/github\.com\/[^\s)"']+\/pull\/\d+/) || [])[0] || null;
+        if (r.code !== 0 && !prUrl) {
+          console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code} (turn ${turn + 1})`);
+          await linearAddComment(iss.id, `⚠️ ${worker}-körningen avslutades med fel (exit ${r.code}, tur ${turn + 1}) — ingen PR garanterad. Se wrapper-loggarna.`);
+          break;
+        }
+        if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a PR link — auto-continuing`);
+      }
+      if (prUrl) {
+        console.log(`[dispatch] ${iss.identifier}: PR opened ${prUrl}`);
+        await linearAddComment(iss.id, `🤖 ${worker} öppnade PR: ${prUrl}`);
+      } else if (lastOut) {
+        await linearAddComment(iss.id, `⚠️ ${worker} avslutade utan PR efter ${maxTurns} turer. Sista utdraget:\n\n> ${redactSensitive(lastOut.slice(-600))}`);
       }
     } catch (err) {
       console.warn(`[dispatch] ${worker} run failed for ${iss.identifier}: ${String(err)}`);
