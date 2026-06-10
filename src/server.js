@@ -1885,7 +1885,15 @@ function slackToken() {
   if (!t) {
     try {
       const cfg = JSON.parse(fs.readFileSync(configPath(), "utf8"));
-      t = cfg?.channels?.slack?.botToken || cfg?.channels?.slack?.bot_token;
+      const slack = cfg?.channels?.slack || {};
+      const accounts = slack.accounts || {};
+      // Tokens live under channels.slack.accounts.<account>.botToken (per-bot:
+      // kent/leo). Kent posts + watches the incident thread, so prefer its token.
+      const preferred = process.env.DISPATCH_SLACK_ACCOUNT?.trim()
+        || process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
+      t = slack.botToken || slack.bot_token
+        || accounts[preferred]?.botToken || accounts[preferred]?.bot_token
+        || Object.values(accounts).map((a) => a?.botToken || a?.bot_token).find(Boolean);
     } catch {}
   }
   _slackToken = t || null;
