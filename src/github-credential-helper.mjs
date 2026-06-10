@@ -10,8 +10,11 @@
 import crypto from "node:crypto";
 
 const op = process.argv[2];
-// We only handle "get". For "store"/"erase" there is nothing to persist/clear.
-if (op !== "get") process.exit(0);
+// Modes: git credential protocol ("get"), or "--token" to print a raw
+// installation token (used as GH_TOKEN for `gh pr create` by the code agent).
+const tokenMode = op === "--token";
+// We only handle "get"/"--token". For "store"/"erase" there is nothing to persist/clear.
+if (op !== "get" && !tokenMode) process.exit(0);
 
 const appId = process.env.GITHUB_APP_ID?.trim();
 const installationId = process.env.GITHUB_APP_INSTALLATION_ID?.trim();
@@ -65,6 +68,11 @@ async function main() {
     process.exit(1);
   }
 
+  if (tokenMode) {
+    // Raw token for GH_TOKEN consumers (gh CLI / REST calls).
+    process.stdout.write(`${data.token}\n`);
+    return;
+  }
   // git credential protocol: key=value lines on stdout.
   process.stdout.write(`username=x-access-token\npassword=${data.token}\n`);
 }

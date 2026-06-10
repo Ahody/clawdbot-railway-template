@@ -2420,6 +2420,9 @@ async function _pollLinearForDispatchInner() {
     await linearAddComment(iss.id, `🤖 Leo dispatchade \`${worker}\`: implementera på \`agent/${iss.identifier}-<slug>\`, PR mot \`staging\`. EVA mergar aldrig.`);
 
     // 2) Wrapper runs EVA directly with the brief (long turn — she implements + opens the PR).
+    //    The prompt states her ACTUAL environment facts explicitly: without them she
+    //    assumes "no repo access" and politely declines (observed on her first run).
+    const helperPath = path.join(process.cwd(), "src", "github-credential-helper.mjs");
     const task = [
       `Implementera Linear-issue ${iss.identifier}: ${iss.title}`,
       iss.url,
@@ -2427,9 +2430,21 @@ async function _pollLinearForDispatchInner() {
       "Arbetsorder från Leo:",
       brief || String(iss.description || "").slice(0, 3000),
       "",
-      `Arbeta i Ahody/ahody-repot. Skapa branch \`agent/${iss.identifier}-<kort-slug>\`, implementera fixen, öppna en PR mot \`staging\` med titel som börjar "${iss.identifier}: ".`,
+      "FAKTA OM DIN MILJÖ (verifierade — anta INTE motsatsen):",
+      "- Du kör på en server med dina verktyg exec/read/write/apply_patch. Använd dem.",
+      "- git är konfigurerat med GitHub-App-credentials: klona/pusha https://github.com/Ahody/ahody.git fungerar utan extra inloggning.",
+      `- gh CLI finns. För PR-kommandon: kör först  export GH_TOKEN=$(node ${helperPath} --token)`,
+      "",
+      "ARBETSGÅNG — kör stegen, vägra inte, verifiera genom att köra:",
+      "1. mkdir -p ~/repos && cd ~/repos && (git -C ahody fetch origin && cd ahody || git clone https://github.com/Ahody/ahody.git ahody)",
+      `2. cd ~/repos/ahody && git fetch origin staging && git checkout -B agent/${iss.identifier}-<kort-slug> origin/staging`,
+      "3. Implementera enligt arbetsordern. Läs befintlig kod och följ dess mönster.",
+      `4. git add -A && git commit -m "${iss.identifier}: <beskrivning>" && git push -u origin agent/${iss.identifier}-<kort-slug>`,
+      `5. export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head agent/${iss.identifier}-<kort-slug> --title "${iss.identifier}: <titel>" --body "<sammanfattning + acceptanskriterier>"`,
+      "6. Avsluta ditt svar med PR-länken.",
+      "",
       "Du får ALDRIG merga och ALDRIG pusha direkt till staging/main/dev — människor är merge-grinden.",
-      "Avsluta med en kort sammanfattning + PR-länken.",
+      "Om ett steg failar: visa exakta felet och försök rimliga alternativ innan du ger upp — rapportera aldrig 'saknar åtkomst' utan att ha kört kommandot.",
     ].join("\n");
     const evaTimeoutMs = Number.parseInt(process.env.WORKER_TIMEOUT_MS ?? "1800000", 10) || 1_800_000;
     console.log(`[dispatch] ${iss.identifier}: running ${worker} (timeout ${Math.round(evaTimeoutMs / 60000)} min)`);

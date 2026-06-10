@@ -78,6 +78,14 @@ RUN apt-get update \
     fonts-noto-color-emoji \
   && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI — the code agent (EVA) opens PRs with `gh pr create`. Auth comes
+# from GH_TOKEN minted on demand: GH_TOKEN=$(node /app/src/github-credential-helper.mjs --token)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh \
+  && rm -rf /var/lib/apt/lists/*
+
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
