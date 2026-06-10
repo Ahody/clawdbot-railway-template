@@ -2032,24 +2032,67 @@ async function kentAuthorIssue(context) {
   return title ? { title, body } : null;
 }
 
-// ---- Poll watched Slack threads for human approval (👍 or keyword reply) ----
-async function checkThreadApproval(rec, opts) {
-  const allowed = (uid) => uid && uid !== opts.botId && (opts.approvers.length === 0 || opts.approvers.includes(uid));
+// ---- Poll watched Slack threads: human approval (👍/keyword) + thread chat ----
+// Non-keyword replies are forwarded to the Kent agent (with the incident context
+// and a per-thread session for continuity) and his answer is posted back in the
+// thread — so the incident thread is an actual conversation with Kent, with the
+// approval signal (👍/keyword) layered on top. Opt out: DISPATCH_THREAD_CHAT=false.
+async function fetchThreadState(rec) {
   const rr = await slackCall("reactions.get", { channel: rec.channel, timestamp: rec.ts });
-  for (const re of (rr?.ok ? rr.message?.reactions || [] : [])) {
+  const cr = await slackCall("conversations.replies", { channel: rec.channel, ts: rec.ts, limit: 100 });
+  return {
+    reactions: rr?.ok ? rr.message?.reactions || [] : [],
+    messages: cr?.ok ? cr.messages || [] : [],
+  };
+}
+function findApproval(state, rec, opts) {
+  const allowed = (uid) => uid && uid !== opts.botId && (opts.approvers.length === 0 || opts.approvers.includes(uid));
+  for (const re of state.reactions) {
     if (re.name === opts.reaction) {
       const by = (re.users || []).find(allowed);
       if (by) return { by, via: "reaction" };
     }
   }
-  const cr = await slackCall("conversations.replies", { channel: rec.channel, ts: rec.ts, limit: 50 });
-  for (const msg of (cr?.ok ? cr.messages || [] : [])) {
+  for (const msg of state.messages) {
     if (msg.ts === rec.ts || msg.bot_id || !allowed(msg.user)) continue;
     const txt = String(msg.text || "").toLowerCase();
-    if (opts.keywords.some((k) => txt.includes(k))) return { by: msg.user, via: "reply" };
+    if (opts.keywords.some((k) => txt.includes(k))) return { by: msg.user, via: "reply", ts: msg.ts };
   }
   return null;
 }
+
+// Forward one human thread-reply to Kent and return his (redacted) answer.
+// A stable per-thread session key gives Kent memory across turns in the thread.
+async function kentThreadReply(rec, question) {
+  const agent = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
+  const sessionKey = `agent:${agent}:incident-${String(rec.ts).replace(/\./g, "-")}`;
+  const prompt = [
+    "Du är Kent, drift-agent, och svarar i en Slack-incident-tråd. Svara på REN SVENSKA, kort och konkret.",
+    "",
+    "Incident-kontext:",
+    String(rec.context?.summary || "(saknas)").slice(0, 2200),
+    "",
+    `Människans meddelande i tråden: ${String(question || "").slice(0, 1500)}`,
+    "",
+    "Du kan INTE själv läsa BugSink/köra verktyg — svara utifrån kontexten ovan och säg ärligt om något inte framgår.",
+    "Om människan vill gå vidare med en fix: påminn om att 👍:a incidenten eller svara 'skapa' så skapas en Linear-issue och Leo dispatchar.",
+    "Inkludera ALDRIG PII / e-post / tokens / nycklar / kunddata.",
+    "Svara EXAKT i detta format och inget annat:",
+    "<<<REPLY>>>",
+    "<ditt svar>",
+    "<<<END>>>",
+  ].join("\n");
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agent, "--session-key", sessionKey, "--message", prompt]), { timeoutMs: 120_000 });
+    const m = (r.output || "").match(/<<<REPLY>>>([\s\S]*?)<<<END>>>/);
+    const text = m ? redactSensitive(m[1].trim()).slice(0, 2900) : "";
+    return text || null;
+  } catch (err) {
+    console.warn(`[dispatch] kent thread reply failed: ${String(err)}`);
+    return null;
+  }
+}
+
 async function pollSlackApprovals() {
   if (!dispatchEnabled() || !slackToken()) return;
   const threads = dispLoad("dispatch-threads.json", {});
@@ -2059,27 +2102,52 @@ async function pollSlackApprovals() {
     approvers: (process.env.DISPATCH_APPROVERS || "").split(",").map((s) => s.trim()).filter(Boolean),
     botId: await slackBotUserId(),
   };
+  const chatEnabled = String(process.env.DISPATCH_THREAD_CHAT ?? "true").toLowerCase() !== "false";
   const TTL = 48 * 3600 * 1000;
   let changed = false;
   for (const [ts, rec] of Object.entries(threads)) {
-    if (rec.approved) continue;
     if (Date.now() - (rec.postedAt || 0) > TTL) { delete threads[ts]; changed = true; continue; }
-    const approval = await checkThreadApproval(rec, opts);
-    if (!approval) continue;
-    console.log(`[dispatch] approval on ts=${ts} via ${approval.via} by ${approval.by}`);
-    const authored = await kentAuthorIssue(rec.context);
-    if (!authored) {
-      await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: ts, text: "⚠️ Kunde inte författa Linear-issue (Kent gav inget svar)." });
-      continue;
+    const state = await fetchThreadState(rec);
+    rec.answered = rec.answered || [];
+
+    // 1) Approval → Kent authors → wrapper creates the Linear issue.
+    if (!rec.approved) {
+      const approval = findApproval(state, rec, opts);
+      if (approval) {
+        console.log(`[dispatch] approval on ts=${ts} via ${approval.via} by ${approval.by}`);
+        if (approval.ts && !rec.answered.includes(approval.ts)) rec.answered.push(approval.ts);
+        const authored = await kentAuthorIssue(rec.context);
+        if (!authored) {
+          await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: ts, text: "⚠️ Kunde inte författa Linear-issue (Kent gav inget svar)." });
+        } else {
+          const created = await createLinearIssue(authored.title, authored.body);
+          rec.approved = true; rec.issue = created?.identifier || null;
+          await slackCall("chat.postMessage", {
+            channel: rec.channel, thread_ts: ts,
+            text: created?.identifier
+              ? `✅ Skapade ${created.identifier} (label \`${dispatchLabel()}\`) för Leo: ${created.url}`
+              : "⚠️ Kunde inte skapa Linear-issue (se loggar).",
+          });
+        }
+        changed = true;
+      }
     }
-    const created = await createLinearIssue(authored.title, authored.body);
-    rec.approved = true; rec.issue = created?.identifier || null; changed = true;
-    await slackCall("chat.postMessage", {
-      channel: rec.channel, thread_ts: ts,
-      text: created?.identifier
-        ? `✅ Skapade ${created.identifier} (label \`${dispatchLabel()}\`) för Leo: ${created.url}`
-        : "⚠️ Kunde inte skapa Linear-issue (se loggar).",
-    });
+
+    // 2) Thread chat: forward unanswered human replies to Kent (skip approval
+    //    keywords while approval is still pending — those are the signal).
+    if (chatEnabled) {
+      const pending = state.messages.filter((m) => {
+        if (m.ts === rec.ts || m.bot_id || !m.user || m.user === opts.botId) return false;
+        if (rec.answered.includes(m.ts)) return false;
+        if (!rec.approved && opts.keywords.some((k) => String(m.text || "").toLowerCase().includes(k))) return false;
+        return true;
+      }).slice(0, 3); // cap per cycle to keep turns cheap
+      for (const msg of pending) {
+        rec.answered.push(msg.ts); changed = true;
+        const reply = await kentThreadReply(rec, msg.text);
+        if (reply) await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: ts, text: reply });
+      }
+    }
   }
   if (changed) dispSave("dispatch-threads.json", threads);
 }
