@@ -2327,7 +2327,14 @@ async function pollSlackApprovals() {
 // ---- Poll Linear: (1) Backlog/Todo → Leo dispatches EVA + issue → In Progress;
 // ---- (2) In Progress issues where EVA's PR exists (GitHub attachment) → In PR review.
 // EVA never merges — humans are the merge gate; Leo owns the status moves.
+let _dispatchInFlight = false;
 async function pollLinearForDispatch() {
+  // EVA runs are long (up to WORKER_TIMEOUT_MS); never let poll ticks overlap.
+  if (_dispatchInFlight) return;
+  _dispatchInFlight = true;
+  try { await _pollLinearForDispatchInner(); } finally { _dispatchInFlight = false; }
+}
+async function _pollLinearForDispatchInner() {
   if (!dispatchEnabled()) return;
   const teamId = process.env.LINEAR_TEAM_ID?.trim();
   if (!teamId || !process.env.LINEAR_API_KEY?.trim()) return;
@@ -2349,30 +2356,70 @@ async function pollLinearForDispatch() {
   );
   const todo = d1?.team?.issues?.nodes || [];
   const seen = new Set(dispLoad("dispatch-seen-issues.json", []));
-  let changed = false;
   for (const iss of todo) {
     if (seen.has(iss.id)) continue;
-    const prompt = [
-      `Ny dispatch-issue: ${iss.identifier} — ${iss.title}`,
-      iss.url,
-      "",
-      String(iss.description || "").slice(0, 3000),
-      "",
-      `Du är Leo (dispatch-only). Dispatcha en worker: be agenten "${worker}" implementera fixen på en branch \`agent/${iss.identifier}-<slug>\` och öppna en PR mot \`staging\` med titeln som börjar "${iss.identifier}: ...".`,
-      "Du mergar ALDRIG och pushar ALDRIG till staging/main/dev — människor är merge-grinden. Bekräfta kort vad du dispatchade.",
-    ].join("\n");
-    console.log(`[dispatch] Leo dispatching ${iss.identifier} → ${worker}`);
+    // Mark seen up front so an overlapping poll can never double-dispatch.
+    seen.add(iss.id);
+    dispSave("dispatch-seen-issues.json", [...seen]);
+
+    // 1) Leo (orchestrator) authors the worker brief. Agent→agent sends are
+    //    blocked by the runtime allowlist, so the WRAPPER runs EVA — Leo only
+    //    writes the order. Falls back to the raw issue if Leo gives nothing.
+    let brief = "";
     try {
-      await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", leo, "--message", prompt]), { timeoutMs: 240_000 });
-    } catch (err) { console.warn(`[dispatch] Leo dispatch failed for ${iss.identifier}: ${String(err)}`); continue; }
-    seen.add(iss.id); changed = true;
+      const lp = [
+        `Dispatch-issue: ${iss.identifier} — ${iss.title}`,
+        iss.url,
+        "",
+        String(iss.description || "").slice(0, 3000),
+        "",
+        "Du är Leo (orchestrator). Författa en kort, konkret ARBETSORDER till EVA (kod-agenten):",
+        "mål, var i koden (om det framgår), acceptanskriterier, och eventuella fällor.",
+        "Svara EXAKT i detta format och inget annat:",
+        "<<<BRIEF>>>",
+        "<arbetsordern>",
+        "<<<END>>>",
+      ].join("\n");
+      const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", leo, "--message", lp]), { timeoutMs: 120_000 });
+      brief = ((r.output || "").match(/<<<BRIEF>>>([\s\S]*?)<<<END>>>/) || [])[1]?.trim() || "";
+    } catch (err) { console.warn(`[dispatch] Leo brief failed for ${iss.identifier}: ${String(err)}`); }
+
+    // Status moves first, so Linear reflects reality while EVA works.
     await relabelDispatched(iss.id);
     if (leoId) await linearGql(`mutation($id:String!,$a:String!){ issueUpdate(id:$id, input:{ assigneeId:$a }){ success } }`, { id: iss.id, a: leoId });
     const progress = await linearStateByName(process.env.DISPATCH_PROGRESS_STATE?.trim() || "In Progress");
     if (progress) await linearSetState(iss.id, progress.id);
-    await linearAddComment(iss.id, `🤖 Leo dispatchade \`${worker}\` att implementera detta och öppna en PR mot staging.`);
+    await linearAddComment(iss.id, `🤖 Leo dispatchade \`${worker}\`: implementera på \`agent/${iss.identifier}-<slug>\`, PR mot \`staging\`. EVA mergar aldrig.`);
+
+    // 2) Wrapper runs EVA directly with the brief (long turn — she implements + opens the PR).
+    const task = [
+      `Implementera Linear-issue ${iss.identifier}: ${iss.title}`,
+      iss.url,
+      "",
+      "Arbetsorder från Leo:",
+      brief || String(iss.description || "").slice(0, 3000),
+      "",
+      `Arbeta i Ahody/ahody-repot. Skapa branch \`agent/${iss.identifier}-<kort-slug>\`, implementera fixen, öppna en PR mot \`staging\` med titel som börjar "${iss.identifier}: ".`,
+      "Du får ALDRIG merga och ALDRIG pusha direkt till staging/main/dev — människor är merge-grinden.",
+      "Avsluta med en kort sammanfattning + PR-länken.",
+    ].join("\n");
+    const evaTimeoutMs = Number.parseInt(process.env.WORKER_TIMEOUT_MS ?? "1800000", 10) || 1_800_000;
+    console.log(`[dispatch] ${iss.identifier}: running ${worker} (timeout ${Math.round(evaTimeoutMs / 60000)} min)`);
+    try {
+      const r = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["agent", "--agent", worker, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", task]),
+        { timeoutMs: evaTimeoutMs + 60_000 },
+      );
+      if (r.code !== 0) {
+        console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code}`);
+        await linearAddComment(iss.id, `⚠️ ${worker}-körningen avslutades med fel (exit ${r.code}) — ingen PR garanterad. Se wrapper-loggarna.`);
+      }
+    } catch (err) {
+      console.warn(`[dispatch] ${worker} run failed for ${iss.identifier}: ${String(err)}`);
+      await linearAddComment(iss.id, `⚠️ ${worker}-körningen kraschade — ingen PR. Se wrapper-loggarna.`);
+    }
   }
-  if (changed) dispSave("dispatch-seen-issues.json", [...seen]);
 
   // ── Phase 2: In Progress + EVA's PR linked → move to "In PR review" ──────
   const reviewName = process.env.DISPATCH_REVIEW_STATE?.trim() || "In PR review";
