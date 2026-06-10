@@ -2093,6 +2093,34 @@ async function kentThreadReply(rec, question) {
   }
 }
 
+// Adopt incident posts the wrapper didn't track itself (e.g. posted via the
+// legacy `openclaw message send` path before dispatch went live, or during a
+// fallback). Scans recent channel history for Kent-bot messages that look like
+// incidents and aren't in the threads file — so 👍/keyword/chat works in EVERY
+// incident thread (≤48h), not only ones posted by the new code path.
+async function adoptUntrackedIncidents(threads) {
+  const channel = slackChannelId();
+  if (!channel) return false;
+  const botId = await slackBotUserId();
+  const hist = await slackCall("conversations.history", { channel, limit: 100 });
+  if (!hist?.ok) return false;
+  const cutoff = Date.now() - 48 * 3600 * 1000;
+  let changed = false;
+  for (const msg of hist.messages || []) {
+    const ts = msg.ts;
+    if (!ts || threads[ts]) continue;
+    const postedAt = Math.floor(Number(ts) * 1000);
+    if (!Number.isFinite(postedAt) || postedAt < cutoff) continue;
+    if (!(msg.bot_id || msg.user === botId)) continue; // only Kent-bot posts
+    const text = String(msg.text || "");
+    if (!/incident/i.test(text)) continue;
+    threads[ts] = { channel, ts, postedAt, approved: false, adopted: true, context: { summary: text.slice(0, 3000) } };
+    changed = true;
+    console.log(`[dispatch] adopted untracked incident thread ts=${ts}`);
+  }
+  return changed;
+}
+
 async function pollSlackApprovals() {
   if (!dispatchEnabled() || !slackToken()) return;
   const threads = dispLoad("dispatch-threads.json", {});
@@ -2104,7 +2132,7 @@ async function pollSlackApprovals() {
   };
   const chatEnabled = String(process.env.DISPATCH_THREAD_CHAT ?? "true").toLowerCase() !== "false";
   const TTL = 48 * 3600 * 1000;
-  let changed = false;
+  let changed = await adoptUntrackedIncidents(threads);
   for (const [ts, rec] of Object.entries(threads)) {
     if (Date.now() - (rec.postedAt || 0) > TTL) { delete threads[ts]; changed = true; continue; }
     const state = await fetchThreadState(rec);
@@ -2115,7 +2143,13 @@ async function pollSlackApprovals() {
       const approval = findApproval(state, rec, opts);
       if (approval) {
         console.log(`[dispatch] approval on ts=${ts} via ${approval.via} by ${approval.by}`);
-        if (approval.ts && !rec.answered.includes(approval.ts)) rec.answered.push(approval.ts);
+        // Mark every keyword-bearing reply as handled — repeated "skapa issue"
+        // messages are all part of the same approval, not chat to answer.
+        for (const msg of state.messages) {
+          if (msg.ts !== rec.ts && !msg.bot_id && opts.keywords.some((k) => String(msg.text || "").toLowerCase().includes(k)) && !rec.answered.includes(msg.ts)) {
+            rec.answered.push(msg.ts);
+          }
+        }
         const authored = await kentAuthorIssue(rec.context);
         if (!authored) {
           await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: ts, text: "⚠️ Kunde inte författa Linear-issue (Kent gav inget svar)." });
