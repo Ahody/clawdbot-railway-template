@@ -2382,6 +2382,24 @@ async function verifyPrExists(url, helperPath) {
   } catch { return true; } // network hiccup → don't fail the run on the verifier
 }
 
+// Ground truth for the false-completion failure: did EVA actually push a branch
+// for this issue? Returns the pushed branch name (agent/<id>-*) or null. Used to
+// confront her with reality when she claims "done" without a PR.
+async function matchingAgentBranch(identifier, helperPath) {
+  const token = await mintGithubToken(helperPath);
+  if (!token) return null;
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/Ahody/ahody/git/matching-refs/heads/agent/${identifier}-`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "ahody-wrapper" } },
+    );
+    if (!res.ok) return null;
+    const refs = await res.json();
+    if (!Array.isArray(refs) || refs.length === 0) return null;
+    return String(refs[refs.length - 1]?.ref || "").replace(/^refs\/heads\//, "") || null;
+  } catch { return null; }
+}
+
 // Run EVA in ONE session until she opens a verified PR, asks a <<<CLARIFY>>>
 // question, or runs out of turns. Returns { prUrl, clarify, lastOut, exitErr }.
 async function runEvaWorker({ iss, sessionKey, firstMessage, helperPath, worker }) {
@@ -2428,7 +2446,22 @@ async function runEvaWorker({ iss, sessionKey, firstMessage, helperPath, worker 
       continue;
     }
     exitErr = false; // a clean turn clears a prior transient error
-    if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
+    // False-completion guard: she does local work then claims "Klart" without
+    // ever pushing. Confront her with GitHub ground truth so the next turn runs
+    // the real push + gh pr create instead of re-asserting done.
+    if (!prUrl && !correction) {
+      const branch = await matchingAgentBranch(iss.identifier, helperPath);
+      correction = branch
+        ? `Du har INTE öppnat någon PR än. Wrappern kollade GitHub: branchen \`${branch}\` är pushad men det finns INGEN PR. ` +
+          `Kör NU via exec och visa RÅ output: export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head ${branch} --title "${iss.identifier}: <titel>" --body "<sammanfattning + QA-checklista>". Avsluta med PR-URL:en.`
+        : `Du har INTE öppnat någon PR än. Wrappern kollade GitHub: det finns INGEN branch \`agent/${iss.identifier}-*\` och INGEN PR — du har alltså inte pushat. ` +
+          `Lokalt skapade filer, en commit eller en checkout:ad branch räknas INTE som klart. Kör NU via exec och visa RÅ output, i denna ordning: ` +
+          `git -C repos/ahody add -A ; git -C repos/ahody commit -m "${iss.identifier}: <beskrivning>" ; git -C repos/ahody push -u origin <din-branch> ; ` +
+          `export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head <din-branch>. Avsluta med PR-URL:en. Säg ALDRIG "klart" utan en riktig PR-länk.`;
+      console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} no PR — pushed branch=${branch || "NONE"}; sending ground-truth continue`);
+    } else if (!prUrl) {
+      console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
+    }
   }
   return { prUrl, clarify: null, lastOut, exitErr };
 }
@@ -2699,6 +2732,7 @@ async function _pollLinearForDispatchInner() {
       "Att avsluta din tur med en fråga, ett löfte eller 'säg till så kör jag' = misslyckad körning.",
       "Du startar i en FÄRSK session utan historik — det finns inget tidigare avbrutet arbete. Börja från steg 1.",
       "Kör arbetet KLART i denna tur: verktygsanrop hela vägen till en öppnad PR.",
+      "DEFINITION AV KLAR: endast en riktig, pushad PR-URL (https://github.com/Ahody/ahody/pull/<n>) räknas som klart. Lokalt skapade filer, en commit eller en checkout:ad branch är INTE klart — du måste git push + gh pr create. Påstå ALDRIG 'klart'/'implementerat' utan en riktig PR-URL; det verifieras maskinellt mot GitHub.",
       "",
       "Arbetsorder från Leo:",
       brief || String(iss.description || "").slice(0, 3000),
