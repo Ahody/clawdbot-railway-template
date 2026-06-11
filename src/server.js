@@ -2369,7 +2369,7 @@ async function mintGithubToken(helperPath) {
 }
 // Trust nothing: a reported PR link is only accepted after the GitHub API
 // confirms it exists (EVA's first "success" was a fabricated #1224 in 34s).
-async function verifyPrExists(url, helperPath) {
+async function verifyPrExists(url, helperPath, identifier) {
   const m = String(url).match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
   if (!m) return false;
   const token = await mintGithubToken(helperPath);
@@ -2378,7 +2378,23 @@ async function verifyPrExists(url, helperPath) {
     const res = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "ahody-wrapper" },
     });
-    return res.ok;
+    if (!res.ok) return false;
+    // Existence is NOT enough: she once reported unrelated old #385 (a real but
+    // long-merged chore PR) by guessing a number. It must be HER branch for this
+    // issue: head ref agent/<identifier>-*, and not already merged/closed.
+    if (identifier) {
+      const pr = await res.json().catch(() => ({}));
+      const head = String(pr?.head?.ref || "");
+      if (!head.startsWith(`agent/${identifier}-`)) {
+        console.warn(`[dispatch] PR ${url} exists but head "${head}" ≠ agent/${identifier}-* — rejecting (misattributed/fabricated)`);
+        return false;
+      }
+      if (pr?.merged_at || pr?.state === "closed") {
+        console.warn(`[dispatch] PR ${url} is already ${pr.merged_at ? "merged" : "closed"} — rejecting as not a fresh agent PR`);
+        return false;
+      }
+    }
+    return true;
   } catch { return true; } // network hiccup → don't fail the run on the verifier
 }
 
@@ -2428,13 +2444,13 @@ async function runEvaWorker({ iss, sessionKey, firstMessage, helperPath, worker 
     if (clarify && !PR_RE.test(lastOut)) return { prUrl: null, clarify, lastOut, exitErr: false };
     const candidate = (lastOut.match(PR_RE) || [])[0] || null;
     if (candidate) {
-      if (await verifyPrExists(candidate, helperPath)) prUrl = candidate;
+      if (await verifyPrExists(candidate, helperPath, iss.identifier)) prUrl = candidate;
       else {
-        console.warn(`[dispatch] ${iss.identifier}: reported PR does not exist (${candidate}) — fabricated`);
+        console.warn(`[dispatch] ${iss.identifier}: reported PR ${candidate} rejected — not a fresh agent/${iss.identifier}-* PR (fabricated/misattributed)`);
         correction =
-          `Länken ${candidate} FINNS INTE på GitHub — den var påhittad. Påhittade resultat är förbjudna och avslöjas maskinellt. ` +
+          `Länken ${candidate} är INTE din PR för ${iss.identifier} — den finns inte, eller så är det en orelaterad/gammal PR (fel branch). Påhittade eller gissade PR-nummer är förbjudna och avslöjas maskinellt (verifieras mot head-branchen agent/${iss.identifier}-*). ` +
           "Gör arbetet PÅ RIKTIGT med dina verktyg: kör varje kommando via exec och visa dess RÅA output " +
-          "(git clone/checkout, ändringarna, git push, gh pr create). Avsluta med den riktiga PR-länken — den verifieras mot GitHub-API:t.";
+          `(git clone/checkout till agent/${iss.identifier}-<slug>, ändringarna, git push, gh pr create). Avsluta med den riktiga PR-länken.`;
       }
     }
     if (r.code !== 0 && !prUrl) {
