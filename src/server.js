@@ -2057,19 +2057,20 @@ async function createLinearIssue(title, description) {
   const issue = data?.issueCreate?.issue;
   return issue ? { id: issue.id, identifier: issue.identifier, url: issue.url } : null;
 }
-// A decomposition sub-issue: child of `parentId`, parked in Backlog (Todo is the
-// human's per-step trigger), dispatch-labelled + assigned to Leo like any other.
-async function createLinearSubIssue(parentId, title, description) {
+// A decomposition sub-issue: child of `parentId`, dispatch-labelled + assigned to
+// Leo. The FIRST sub-task is created in Todo so the chain auto-starts (it has no
+// dependency); the rest park in Backlog until the human promotes them in order.
+async function createLinearSubIssue(parentId, title, description, stateName) {
   const teamId = process.env.LINEAR_TEAM_ID?.trim();
   if (!process.env.LINEAR_API_KEY?.trim() || !teamId) return null;
   const labelId = await ensureLinearLabel(dispatchLabel());
   const assigneeId = await linearLeoUserId();
-  const backlog = await linearStateByName(process.env.DISPATCH_CREATE_STATE?.trim() || "Backlog");
+  const state = await linearStateByName(stateName || process.env.DISPATCH_CREATE_STATE?.trim() || "Backlog");
   const input = {
     teamId, title, description, parentId,
     ...(labelId ? { labelIds: [labelId] } : {}),
     ...(assigneeId ? { assigneeId } : {}),
-    ...(backlog ? { stateId: backlog.id } : {}),
+    ...(state ? { stateId: state.id } : {}),
   };
   const data = await linearGql(`mutation($input:IssueCreateInput!){ issueCreate(input:$input){ issue{ id identifier url } } }`, { input });
   const issue = data?.issueCreate?.issue;
@@ -2766,9 +2767,9 @@ async function _pollLinearForDispatchInner() {
       brief = ((out.match(/<<<BRIEF>>>([\s\S]*?)<<<END>>>/) || [])[1]?.trim()) || "";
     } catch (err) { console.warn(`[dispatch] Leo brief/decompose failed for ${iss.identifier}: ${String(err)}`); }
 
-    // ── DECOMPOSE path: create sequential sub-issues in Backlog; DON'T run EVA on
-    //    the parent. Human promotes each sub-issue to Todo in order (a dep needs
-    //    the previous PR MERGED to staging first — and merge is human-gated). ──
+    // ── DECOMPOSE path: sub-task #1 → Todo (auto-starts, no dependency), the rest
+    //    → Backlog. DON'T run EVA on the parent. Human promotes #2+ to Todo in
+    //    order (each needs the previous PR MERGED to staging — human-gated). ──
     if (decomposeBlock) {
       const subtasks = decomposeBlock.split("\n").map((l) => l.trim()).filter(Boolean)
         .map((l) => { const p = l.split("|").map((s) => s.trim()); return p.length >= 2 && /^\d+$/.test(p[0]) ? { title: p[1], detail: p.slice(2).join(" | ") || p[1] } : null; })
@@ -2778,17 +2779,18 @@ async function _pollLinearForDispatchInner() {
         for (let i = 0; i < subtasks.length; i++) {
           const st = subtasks[i];
           const title = `${iss.identifier} · ${i + 1}/${subtasks.length}: ${st.title}`.slice(0, 250);
-          const desc =
-            `Sub-task ${i + 1}/${subtasks.length} för ${iss.identifier} (${iss.url}).\n\n${st.detail}\n\n` +
-            "_Skapad av Leo-dekomposition. Dra till **Todo** först när föregående sub-task är **mergad till staging** (annars saknar EVA de tidigare ändringarna)._";
-          const sub = await createLinearSubIssue(iss.id, title, desc);
+          const note = i === 0
+            ? "_Skapad av Leo-dekomposition. Sub-task 1 har inga beroenden → ligger i **Todo** och dispatchas automatiskt._"
+            : "_Skapad av Leo-dekomposition. Dra till **Todo** först när föregående sub-task är **mergad till staging** (annars saknar EVA de tidigare ändringarna)._";
+          const desc = `Sub-task ${i + 1}/${subtasks.length} för ${iss.identifier} (${iss.url}).\n\n${st.detail}\n\n${note}`;
+          const sub = await createLinearSubIssue(iss.id, title, desc, i === 0 ? "Todo" : "Backlog");
           if (sub) created.push({ ...sub, t: st.title });
         }
         if (created.length >= 2) {
-          const list = created.map((c, i) => `${i + 1}. ${c.identifier} — ${c.t}`).join("\n");
+          const list = created.map((c, i) => `${i + 1}. ${c.identifier} — ${c.t}${i === 0 ? " _(Todo — startar nu)_" : ""}`).join("\n");
           await linearAddComment(iss.id,
-            `🧩 Leo bedömde ${iss.identifier} som för bred för en one-shot och bröt den i ${created.length} sub-issues (i **Backlog**, beroende-ordnade):\n\n${list}\n\n` +
-            "Dra dem till **Todo** en i taget i ordning — merga föregående sub-tasks PR till `staging` innan du startar nästa, annars saknar EVA de tidigare ändringarna.");
+            `🧩 Leo bedömde ${iss.identifier} som för bred för en one-shot och bröt den i ${created.length} sub-issues (beroende-ordnade):\n\n${list}\n\n` +
+            `Sub-task 1 (${created[0].identifier}) ligger i **Todo** och dispatchas automatiskt vid nästa poll. Resten ligger i **Backlog** — dra dem till **Todo** en i taget när föregående sub-tasks PR är **mergad till \`staging\`** (annars saknar EVA de tidigare ändringarna).`);
           const progress = await linearStateByName(process.env.DISPATCH_PROGRESS_STATE?.trim() || "In Progress");
           if (progress) await linearSetState(iss.id, progress.id);
           await relabelDispatched(iss.id);
