@@ -2420,9 +2420,14 @@ async function runEvaWorker({ iss, sessionKey, firstMessage, helperPath, worker 
       }
     }
     if (r.code !== 0 && !prUrl) {
-      console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code} (turn ${turn + 1})`);
-      exitErr = true; break;
+      // Transient model/runtime failures (e.g. Azure gpt-5.3-codex `response.failed`
+      // with no error details, no failover candidate) used to kill the whole run on
+      // turn 1. Retry within the same session instead of breaking — bounded by maxTurns.
+      console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code} (turn ${turn + 1}) — retrying within session`);
+      exitErr = true;
+      continue;
     }
+    exitErr = false; // a clean turn clears a prior transient error
     if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
   }
   return { prUrl, clarify: null, lastOut, exitErr };
@@ -2666,7 +2671,7 @@ async function _pollLinearForDispatchInner() {
         String(iss.description || "").slice(0, 3000),
         "",
         "Du är Leo (orchestrator). Författa en kort, konkret ARBETSORDER till EVA (kod-agenten):",
-        "mål, var i koden (om det framgår), acceptanskriterier, och eventuella fällor.",
+        "mål, var i koden (om det framgår), acceptanskriterier, vilka tester/QA som krävs (frontend: komponenttester + UI-QA-checklista; i18n båda språk om strängar rörs), och eventuella fällor.",
         "Svara EXAKT i detta format och inget annat:",
         "<<<BRIEF>>>",
         "<arbetsordern>",
@@ -2699,17 +2704,32 @@ async function _pollLinearForDispatchInner() {
       brief || String(iss.description || "").slice(0, 3000),
       "",
       "FAKTA OM DIN MILJÖ (verifierade — anta INTE motsatsen):",
-      "- Du kör på en server med dina verktyg exec/read/write/apply_patch. Använd dem.",
+      "- Din arbetskatalog OCH sandbox-rot är din workspace (kör `pwd` för att se den). apply_patch/write får BARA röra filer UNDER den.",
+      "- exec/git får köra var som helst, MEN filändringar utanför workspace (t.ex. ~/ eller /root) blockeras med 'Path escapes sandbox root'. Det var EXAKT felet i förra körningen — undvik det.",
+      "- Därför: klona repot INNE i din workspace och använd ALLTID workspace-relativa sökvägar (repos/ahody/...). ALDRIG ~, /root eller absoluta sökvägar för filändringar.",
       "- git är konfigurerat med GitHub-App-credentials: klona/pusha https://github.com/Ahody/ahody.git fungerar utan extra inloggning.",
       `- gh CLI finns. För PR-kommandon: kör först  export GH_TOKEN=$(node ${helperPath} --token)`,
       "",
-      "ARBETSGÅNG — kör stegen, vägra inte, verifiera genom att köra:",
-      "1. mkdir -p ~/repos && cd ~/repos && (git -C ahody fetch origin && cd ahody || git clone https://github.com/Ahody/ahody.git ahody)",
-      `2. cd ~/repos/ahody && git fetch origin staging && git checkout -B agent/${iss.identifier}-<kort-slug> origin/staging`,
-      "3. Implementera enligt arbetsordern. Läs befintlig kod och följ dess mönster.",
-      `4. git add -A && git commit -m "${iss.identifier}: <beskrivning>" && git push -u origin agent/${iss.identifier}-<kort-slug>`,
-      `5. export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head agent/${iss.identifier}-<kort-slug> --title "${iss.identifier}: <titel>" --body "<sammanfattning + acceptanskriterier>"`,
-      "6. Avsluta ditt svar med PR-länken.",
+      "ARBETSGÅNG — kör stegen, vägra inte, verifiera genom att köra. ALLA sökvägar är RELATIVA till din workspace (börjar med repos/ahody/):",
+      "1. Klona in i workspace:  git clone https://github.com/Ahody/ahody.git repos/ahody   (om den redan finns: git -C repos/ahody fetch origin)",
+      `2. git -C repos/ahody checkout -B agent/${iss.identifier}-<kort-slug> origin/staging`,
+      "3. INNAN du kodar: läs repos/ahody/CLAUDE.md och FÖLJ dess konventioner strikt (se KONVENTIONER nedan — blockerande).",
+      "4. Implementera enligt arbetsordern. Filändringar via apply_patch/write med sökväg som BÖRJAR med repos/ahody/ (t.ex. repos/ahody/src/...). Läs befintlig kod och följ dess mönster.",
+      "5. Lägg till/uppdatera tester för ändringen (se TESTER & QA nedan).",
+      `6. git -C repos/ahody add -A && git -C repos/ahody commit -m "${iss.identifier}: <beskrivning>" && git -C repos/ahody push -u origin agent/${iss.identifier}-<kort-slug>`,
+      `7. export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head agent/${iss.identifier}-<kort-slug> --title "${iss.identifier}: <titel>" --body "<sammanfattning + acceptanskriterier + QA-checklista>"`,
+      "8. Avsluta ditt svar med PR-länken.",
+      "",
+      "KONVENTIONER (från repots CLAUDE.md — blockerande krav, inte polish):",
+      "- i18n: varje användarsynlig sträng går via t('key'); nyckeln MÅSTE finnas i BÅDE src/locales/sv.json OCH src/locales/en.json. Hårdkodad label/placeholder/knapptext/toast = bugg.",
+      "- Databas/DDL: schemaändringar BARA via nya committade filer i supabase/migrations/ (aldrig db push/dashboard/MCP). Uppdatera src/integrations/supabase/types.ts (Row/Insert/Update) vid schemaändring.",
+      "- Nya user-facing features bör gateas via feature flag (useFeatureFlag) om inte issuen uttryckligen säger annat.",
+      "- Håll filer under 500 rader. Följ shadcn/ui-mönster för UI. Läs CLAUDE.md för fullständiga regler innan du kodar.",
+      "",
+      "TESTER & QA (krävs):",
+      "- Skriv/uppdatera tester för din ändring enligt repots mönster (Vitest/Jest). Frontend: komponent-rendering + interaktion + edge-/tomstate.",
+      "- Bedöm om andra tester behövs för scopet (round-trip/persistens, RLS för icke-superadmin, i18n i båda språk) och lägg till de relevanta.",
+      "- I PR-beskrivningen: en QA-checklista som är UI-/beteende-fokuserad (inte kod-fokuserad) — golden path + edge cases, olika roller om relevant, båda språken om i18n rörts.",
       "",
       "Du får ALDRIG merga och ALDRIG pusha direkt till staging/main/dev — människor är merge-grinden.",
       "Om ett steg failar: visa exakta felet och försök rimliga alternativ innan du ger upp — rapportera aldrig 'saknar åtkomst' utan att ha kört kommandot.",
