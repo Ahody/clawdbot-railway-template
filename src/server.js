@@ -2057,6 +2057,24 @@ async function createLinearIssue(title, description) {
   const issue = data?.issueCreate?.issue;
   return issue ? { id: issue.id, identifier: issue.identifier, url: issue.url } : null;
 }
+// A decomposition sub-issue: child of `parentId`, parked in Backlog (Todo is the
+// human's per-step trigger), dispatch-labelled + assigned to Leo like any other.
+async function createLinearSubIssue(parentId, title, description) {
+  const teamId = process.env.LINEAR_TEAM_ID?.trim();
+  if (!process.env.LINEAR_API_KEY?.trim() || !teamId) return null;
+  const labelId = await ensureLinearLabel(dispatchLabel());
+  const assigneeId = await linearLeoUserId();
+  const backlog = await linearStateByName(process.env.DISPATCH_CREATE_STATE?.trim() || "Backlog");
+  const input = {
+    teamId, title, description, parentId,
+    ...(labelId ? { labelIds: [labelId] } : {}),
+    ...(assigneeId ? { assigneeId } : {}),
+    ...(backlog ? { stateId: backlog.id } : {}),
+  };
+  const data = await linearGql(`mutation($input:IssueCreateInput!){ issueCreate(input:$input){ issue{ id identifier url } } }`, { input });
+  const issue = data?.issueCreate?.issue;
+  return issue ? { id: issue.id, identifier: issue.identifier, url: issue.url } : null;
+}
 async function linearAddComment(issueId, body) {
   await linearGql(`mutation($id:String!,$body:String!){ commentCreate(input:{issueId:$id, body:$body}){ success } }`, { id: issueId, body });
 }
@@ -2357,6 +2375,11 @@ async function pollSlackApprovals() {
 // ──────────────────────────────────────────────────────────────────────────
 function dispatchRouterEnabled() {
   return dispatchEnabled() && String(process.env.DISPATCH_ROUTER ?? "true").toLowerCase() !== "false";
+}
+// Leo may split a too-broad issue into sequential one-shot sub-issues instead of
+// briefing EVA directly. Gated by env; the actual small-vs-big call is Leo's.
+function decomposeEnabled() {
+  return dispatchEnabled() && String(process.env.DISPATCH_DECOMPOSE ?? "true").toLowerCase() !== "false";
 }
 const MAX_CLARIFY_ROUNDS = Number.parseInt(process.env.DISPATCH_MAX_CLARIFY_ROUNDS ?? "2", 10) || 2;
 
@@ -2710,10 +2733,10 @@ async function _pollLinearForDispatchInner() {
     seen.add(iss.id);
     dispSave("dispatch-seen-issues.json", [...seen]);
 
-    // 1) Leo (orchestrator) authors the worker brief. Agent→agent sends are
-    //    blocked by the runtime allowlist, so the WRAPPER runs EVA — Leo only
-    //    writes the order. Falls back to the raw issue if Leo gives nothing.
-    let brief = "";
+    // 1) Leo (orchestrator) decides: contained → BRIEF (run EVA); broad
+    //    multi-domain → DECOMPOSE into sequential one-shot sub-issues. Agent→agent
+    //    sends are blocked by the runtime allowlist, so the WRAPPER runs EVA.
+    let brief = "", decomposeBlock = "";
     try {
       const lp = [
         `Dispatch-issue: ${iss.identifier} — ${iss.title}`,
@@ -2721,16 +2744,62 @@ async function _pollLinearForDispatchInner() {
         "",
         String(iss.description || "").slice(0, 3000),
         "",
-        "Du är Leo (orchestrator). Författa en kort, konkret ARBETSORDER till EVA (kod-agenten):",
-        "mål, var i koden (om det framgår), acceptanskriterier, vilka tester/QA som krävs (frontend: komponenttester + UI-QA-checklista; i18n båda språk om strängar rörs), och eventuella fällor.",
-        "Svara EXAKT i detta format och inget annat:",
+        "Du är Leo (orchestrator). FÖRST: bedöm uppgiftens storlek. EVA är en kod-agent som kör headless och pålitligt klarar EN avgränsad ändring per körning (några filer, ett tydligt scope) — men INTE en bred multi-domän-feature (schema + API + UI + tester) i ett enda svep.",
+        "",
+        "Är uppgiften avgränsad/one-shot-bar → författa en ARBETSORDER (mål, var i koden, acceptanskriterier, tester/QA som krävs [frontend: komponenttester + UI-QA-checklista; i18n båda språk om strängar rörs], fällor):",
         "<<<BRIEF>>>",
         "<arbetsordern>",
         "<<<END>>>",
+        ...(decomposeEnabled() ? [
+          "",
+          "Är uppgiften för bred för en körning → BRYT den i sekventiella sub-tasks, var och en en avgränsad one-shot. Ordna efter BEROENDE (det som måste mergas till staging FÖRST kommer först — t.ex. migration → API/mapping → UI → tester). En rad per sub-task, EXAKT formatet `N | kort-titel | vad som ska göras + acceptanskriterier för just denna del`:",
+          "<<<DECOMPOSE>>>",
+          "1 | <kort sub-titel> | <detalj>",
+          "2 | <kort sub-titel> | <detalj>",
+          "<<<END>>>",
+        ] : []),
+        "Svara med EXAKT ett av blocken, inget annat.",
       ].join("\n");
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", leo, "--message", lp]), { timeoutMs: 120_000 });
-      brief = ((r.output || "").match(/<<<BRIEF>>>([\s\S]*?)<<<END>>>/) || [])[1]?.trim() || "";
-    } catch (err) { console.warn(`[dispatch] Leo brief failed for ${iss.identifier}: ${String(err)}`); }
+      const out = r.output || "";
+      decomposeBlock = decomposeEnabled() ? (((out.match(/<<<DECOMPOSE>>>([\s\S]*?)<<<END>>>/) || [])[1]) || "").trim() : "";
+      brief = ((out.match(/<<<BRIEF>>>([\s\S]*?)<<<END>>>/) || [])[1]?.trim()) || "";
+    } catch (err) { console.warn(`[dispatch] Leo brief/decompose failed for ${iss.identifier}: ${String(err)}`); }
+
+    // ── DECOMPOSE path: create sequential sub-issues in Backlog; DON'T run EVA on
+    //    the parent. Human promotes each sub-issue to Todo in order (a dep needs
+    //    the previous PR MERGED to staging first — and merge is human-gated). ──
+    if (decomposeBlock) {
+      const subtasks = decomposeBlock.split("\n").map((l) => l.trim()).filter(Boolean)
+        .map((l) => { const p = l.split("|").map((s) => s.trim()); return p.length >= 2 && /^\d+$/.test(p[0]) ? { title: p[1], detail: p.slice(2).join(" | ") || p[1] } : null; })
+        .filter(Boolean);
+      if (subtasks.length >= 2) {
+        const created = [];
+        for (let i = 0; i < subtasks.length; i++) {
+          const st = subtasks[i];
+          const title = `${iss.identifier} · ${i + 1}/${subtasks.length}: ${st.title}`.slice(0, 250);
+          const desc =
+            `Sub-task ${i + 1}/${subtasks.length} för ${iss.identifier} (${iss.url}).\n\n${st.detail}\n\n` +
+            "_Skapad av Leo-dekomposition. Dra till **Todo** först när föregående sub-task är **mergad till staging** (annars saknar EVA de tidigare ändringarna)._";
+          const sub = await createLinearSubIssue(iss.id, title, desc);
+          if (sub) created.push({ ...sub, t: st.title });
+        }
+        if (created.length >= 2) {
+          const list = created.map((c, i) => `${i + 1}. ${c.identifier} — ${c.t}`).join("\n");
+          await linearAddComment(iss.id,
+            `🧩 Leo bedömde ${iss.identifier} som för bred för en one-shot och bröt den i ${created.length} sub-issues (i **Backlog**, beroende-ordnade):\n\n${list}\n\n` +
+            "Dra dem till **Todo** en i taget i ordning — merga föregående sub-tasks PR till `staging` innan du startar nästa, annars saknar EVA de tidigare ändringarna.");
+          const progress = await linearStateByName(process.env.DISPATCH_PROGRESS_STATE?.trim() || "In Progress");
+          if (progress) await linearSetState(iss.id, progress.id);
+          await relabelDispatched(iss.id);
+          console.log(`[dispatch] ${iss.identifier}: decomposed into ${created.length} sub-issues (Backlog)`);
+          continue; // parent handled — never run EVA on the umbrella issue
+        }
+        console.warn(`[dispatch] ${iss.identifier}: decompose parsed ${subtasks.length} but created ${created.length} — falling back to brief`);
+      } else {
+        console.warn(`[dispatch] ${iss.identifier}: DECOMPOSE had <2 valid sub-tasks — treating as brief`);
+      }
+    }
 
     // Status moves first, so Linear reflects reality while EVA works.
     await relabelDispatched(iss.id);
