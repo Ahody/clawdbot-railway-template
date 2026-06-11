@@ -2538,6 +2538,8 @@ async function leoRouteClarification({ iss, brief, question, diagnostics }) {
     diagnostics ? "" : "- NEED_DIAGNOSTICS: du behöver mer drift-/incident-kontext (vilken BugSink-issue, stacktrace, repro) innan du kan svara. Beskriv exakt vad Kent ska ta fram.",
     "- ESCALATE: det är ett genuint produkt-/UX-/affärsbeslut som en MÄNNISKA måste fatta (varken du eller Kent kan avgöra det). Formulera frågan till människan kort och konkret.",
     "",
+    "VIKTIGT — eskalera INTE i onödan: tekniska frågor, process/workflow ('får jag göra om', 'vilket branchnamn ska jag använda', 'små exec-anrop?'), eller en begäran om LOV att fortsätta är ALDRIG ESCALATE. Svara då ANSWER med ett rakt 'ja, kör på' (valfritt branchnamn som börjar med agent/<issue-id>- är alltid ok). ESCALATE är reserverat ENBART för val som ändrar produkten/beteendet och som varken du eller Kent får fatta.",
+    "",
     "Svara EXAKT i detta format, inget annat:",
     "<<<ROUTE>>>",
     `decision: ANSWER | ${diagnostics ? "" : "NEED_DIAGNOSTICS | "}ESCALATE`,
@@ -2861,7 +2863,8 @@ async function _pollLinearForDispatchInner() {
       ...(dispatchRouterEnabled() ? [
         "",
         "AUTONOMI vs FRÅGOR: Lös tekniska/implementations-tvetydigheter SJÄLV (vilken fil, vilket mönster, finns hjälpfunktionen — läs koden och bestäm). Fråga ALDRIG om sådant — gissa rimligt och fortsätt.",
-        "BARA om uppgiften är genuint UNDERBESTÄMD så att en gissning skulle slösa hela PR-cykeln (du står mellan två materiellt olika tolkningar och varken brief eller issue avgör vilken) — STANNA i stället för att gissa. Avsluta då turen med EXAKT detta och inget annat:",
+        "CLARIFY är ALDRIG för process- eller tillstånds-frågor: branchnamn (välj själv `agent/<issue-id>-<slug>`), 'får jag göra om', 'ska jag köra små exec-anrop', verktygs-/output-strul, eller att be om LOV att fortsätta — sånt beslutar och gör du SJÄLV. Strular din egen exec-output: kör om i mindre anrop, fråga inte.",
+        "BARA om uppgiften är genuint UNDERBESTÄMD så att en gissning skulle slösa hela PR-cykeln (du står mellan två materiellt olika tolkningar som ger OLIKA produkt/beteende och varken brief eller issue avgör vilken) — STANNA i stället för att gissa. Avsluta då turen med EXAKT detta och inget annat:",
         "<<<CLARIFY>>>",
         "<din fråga + de två alternativen du står mellan, kort>",
         "<<<END>>>",
