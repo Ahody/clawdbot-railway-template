@@ -2446,19 +2446,21 @@ async function runEvaWorker({ iss, sessionKey, firstMessage, helperPath, worker 
       continue;
     }
     exitErr = false; // a clean turn clears a prior transient error
-    // False-completion guard: she does local work then claims "Klart" without
-    // ever pushing. Confront her with GitHub ground truth so the next turn runs
-    // the real push + gh pr create instead of re-asserting done.
+    // No-PR guard. Two distinct cases — DON'T conflate them (a wrong "push now"
+    // when nothing is implemented sends her into a justification loop):
+    //  - branch pushed, no PR  → false-completion: run gh pr create now.
+    //  - no branch             → either not-done OR done-not-pushed: tell her to
+    //    KEEP IMPLEMENTING (no deferral), and push only WHEN done.
     if (!prUrl && !correction) {
       const branch = await matchingAgentBranch(iss.identifier, helperPath);
       correction = branch
-        ? `Du har INTE öppnat någon PR än. Wrappern kollade GitHub: branchen \`${branch}\` är pushad men det finns INGEN PR. ` +
+        ? `Wrappern kollade GitHub: branchen \`${branch}\` är pushad men det finns INGEN PR. ` +
           `Kör NU via exec och visa RÅ output: export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head ${branch} --title "${iss.identifier}: <titel>" --body "<sammanfattning + QA-checklista>". Avsluta med PR-URL:en.`
-        : `Du har INTE öppnat någon PR än. Wrappern kollade GitHub: det finns INGEN branch \`agent/${iss.identifier}-*\` och INGEN PR — du har alltså inte pushat. ` +
-          `Lokalt skapade filer, en commit eller en checkout:ad branch räknas INTE som klart. Kör NU via exec och visa RÅ output, i denna ordning: ` +
-          `git -C repos/ahody add -A ; git -C repos/ahody commit -m "${iss.identifier}: <beskrivning>" ; git -C repos/ahody push -u origin <din-branch> ; ` +
-          `export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head <din-branch>. Avsluta med PR-URL:en. Säg ALDRIG "klart" utan en riktig PR-länk.`;
-      console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} no PR — pushed branch=${branch || "NONE"}; sending ground-truth continue`);
+        : `Du har INGEN öppen PR än (wrappern kollade GitHub: ingen branch \`agent/${iss.identifier}-*\`, ingen PR). Du är INTE klar — fortsätt i DENNA tur. ` +
+          `Avsluta ALDRIG turen med en plan eller ett löfte ("jag kör igång nu", "återkommer", "jag fortsätter") — det räknas som att du stannat för tidigt och är en misslyckad tur. ` +
+          `Använd dina verktyg NU och faktiskt ändra kod: läs filerna, gör ändringarna fil för fil, skriv testerna. ` +
+          `FÖRST när implementationen är klar: git -C repos/ahody add -A && git -C repos/ahody commit -m "${iss.identifier}: ..." && git -C repos/ahody push -u origin <din-branch>, sedan export GH_TOKEN=$(node ${helperPath} --token) && gh pr create -R Ahody/ahody --base staging --head <din-branch>. Ditt enda godkända slutsvar är en riktig PR-URL.`;
+      console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} no PR — pushed branch=${branch || "NONE"}; sending ${branch ? "open-PR" : "keep-implementing"} continue`);
     } else if (!prUrl) {
       console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
     }
@@ -2733,6 +2735,7 @@ async function _pollLinearForDispatchInner() {
       "Du startar i en FÄRSK session utan historik — det finns inget tidigare avbrutet arbete. Börja från steg 1.",
       "Kör arbetet KLART i denna tur: verktygsanrop hela vägen till en öppnad PR.",
       "DEFINITION AV KLAR: endast en riktig, pushad PR-URL (https://github.com/Ahody/ahody/pull/<n>) räknas som klart. Lokalt skapade filer, en commit eller en checkout:ad branch är INTE klart — du måste git push + gh pr create. Påstå ALDRIG 'klart'/'implementerat' utan en riktig PR-URL; det verifieras maskinellt mot GitHub.",
+      "Ditt ENDA godkända slutsvar är en riktig PR-URL eller en <<<CLARIFY>>>-fråga. Avsluta ALDRIG turen med en plan eller ett löfte ('jag kör igång nu', 'återkommer', 'jag fortsätter') — det betyder att du stannat för tidigt. Gör arbetet med verktygen i denna tur i stället.",
       "",
       "Arbetsorder från Leo:",
       brief || String(iss.description || "").slice(0, 3000),
