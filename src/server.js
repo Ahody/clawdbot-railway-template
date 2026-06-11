@@ -2347,6 +2347,263 @@ async function pollSlackApprovals() {
   if (changed) dispSave("dispatch-threads.json", threads);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Leo-as-router: when EVA stops mid-task with a <<<CLARIFY>>> question instead
+// of a PR, the wrapper routes it to Leo. Leo ANSWERS (optionally after pulling
+// Kent for diagnostics), or ESCALATES to a human in Slack (task parked + resumed
+// on reply). EVA never talks to a human directly: EVA → Leo → (Leo / Kent / human).
+// The loop is wrapper-mediated on purpose: a spawned leaf-subagent has no session
+// tools and can only announce on completion, so it cannot ask mid-run.
+// ──────────────────────────────────────────────────────────────────────────
+function dispatchRouterEnabled() {
+  return dispatchEnabled() && String(process.env.DISPATCH_ROUTER ?? "true").toLowerCase() !== "false";
+}
+const MAX_CLARIFY_ROUNDS = Number.parseInt(process.env.DISPATCH_MAX_CLARIFY_ROUNDS ?? "2", 10) || 2;
+
+async function mintGithubToken(helperPath) {
+  try {
+    const r = await runCmd(OPENCLAW_NODE, [helperPath, "--token"], { timeoutMs: 30_000 });
+    const t = (r.output || "").trim().split(/\s+/).pop();
+    return r.code === 0 && t && t.length > 20 ? t : null;
+  } catch { return null; }
+}
+// Trust nothing: a reported PR link is only accepted after the GitHub API
+// confirms it exists (EVA's first "success" was a fabricated #1224 in 34s).
+async function verifyPrExists(url, helperPath) {
+  const m = String(url).match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) return false;
+  const token = await mintGithubToken(helperPath);
+  if (!token) { console.warn("[dispatch] could not mint token to verify PR — accepting unverified"); return true; }
+  try {
+    const res = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "ahody-wrapper" },
+    });
+    return res.ok;
+  } catch { return true; } // network hiccup → don't fail the run on the verifier
+}
+
+// Run EVA in ONE session until she opens a verified PR, asks a <<<CLARIFY>>>
+// question, or runs out of turns. Returns { prUrl, clarify, lastOut, exitErr }.
+async function runEvaWorker({ iss, sessionKey, firstMessage, helperPath, worker }) {
+  const evaTimeoutMs = Number.parseInt(process.env.WORKER_TIMEOUT_MS ?? "1800000", 10) || 1_800_000;
+  const maxTurns = Number.parseInt(process.env.WORKER_MAX_TURNS ?? "4", 10) || 4;
+  const PR_RE = /https:\/\/github\.com\/[^\s)"']+\/pull\/\d+/;
+  // Chat models love ending a turn with "say 'continue' and I'll do it" — in a
+  // headless run nobody answers, so the wrapper IS the answer: keep replying
+  // "fortsätt" in the same session until a PR link appears (or turns run out).
+  const continueMsg =
+    "Fortsätt nu. Ingen människa läser detta — kör ALLA steg klart " +
+    "(klona/implementera/committa/pusha/gh pr create) utan att ställa fler frågor. " +
+    "Avsluta med PR-länken.";
+  let prUrl = null, lastOut = "", correction = "", exitErr = false;
+  for (let turn = 0; turn < maxTurns && !prUrl; turn++) {
+    const msg = turn === 0 ? firstMessage : (correction || continueMsg);
+    correction = "";
+    const r = await runCmd(
+      OPENCLAW_NODE,
+      clawArgs(["agent", "--agent", worker, "--session-key", sessionKey, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", msg]),
+      { timeoutMs: evaTimeoutMs + 60_000 },
+    );
+    lastOut = r.output || "";
+    // A clarification question takes priority: she stopped ON PURPOSE, not stuck.
+    const clarify = (lastOut.match(/<<<CLARIFY>>>([\s\S]*?)<<<END>>>/) || [])[1]?.trim();
+    if (clarify && !PR_RE.test(lastOut)) return { prUrl: null, clarify, lastOut, exitErr: false };
+    const candidate = (lastOut.match(PR_RE) || [])[0] || null;
+    if (candidate) {
+      if (await verifyPrExists(candidate, helperPath)) prUrl = candidate;
+      else {
+        console.warn(`[dispatch] ${iss.identifier}: reported PR does not exist (${candidate}) — fabricated`);
+        correction =
+          `Länken ${candidate} FINNS INTE på GitHub — den var påhittad. Påhittade resultat är förbjudna och avslöjas maskinellt. ` +
+          "Gör arbetet PÅ RIKTIGT med dina verktyg: kör varje kommando via exec och visa dess RÅA output " +
+          "(git clone/checkout, ändringarna, git push, gh pr create). Avsluta med den riktiga PR-länken — den verifieras mot GitHub-API:t.";
+      }
+    }
+    if (r.code !== 0 && !prUrl) {
+      console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code} (turn ${turn + 1})`);
+      exitErr = true; break;
+    }
+    if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
+  }
+  return { prUrl, clarify: null, lastOut, exitErr };
+}
+
+// Ask Leo how to handle EVA's clarification. Returns { decision, body }.
+// decision ∈ ANSWER | NEED_DIAGNOSTICS | ESCALATE.
+async function leoRouteClarification({ iss, brief, question, diagnostics }) {
+  const leo = process.env.LEO_AGENT?.trim() || "leo";
+  let comments = "";
+  try {
+    const c = await linearGql(`query($id:String!){ issue(id:$id){ comments(first:8){ nodes{ body } } } }`, { id: iss.id });
+    comments = (c?.issue?.comments?.nodes || []).map((n) => `- ${String(n.body || "").slice(0, 350)}`).join("\n");
+  } catch {}
+  const prompt = [
+    "Du är Leo (orchestrator). Din kod-agent EVA har STANNAT mitt i ett Linear-task på en blockerande fråga och ber om vägledning. Avgör hur den ska besvaras.",
+    "",
+    `Issue: ${iss.identifier} — ${iss.title}`,
+    iss.url,
+    "Issue-beskrivning:",
+    String(iss.description || "").slice(0, 2500),
+    comments ? `Senaste kommentarer:\n${comments}` : "",
+    "",
+    "Din ursprungliga arbetsorder till Eva:",
+    brief || "(ingen explicit brief — hon fick issue-beskrivningen)",
+    "",
+    "Evas fråga:",
+    question,
+    diagnostics ? `\nDiagnostik från Kent (du bad om den):\n${diagnostics}` : "",
+    "",
+    "Tre vägar:",
+    "- ANSWER: du kan avgöra det själv från issue/brief/kod (teknisk eller scope-fråga). Ge Eva ett tydligt, BESLUTANDE svar.",
+    diagnostics ? "" : "- NEED_DIAGNOSTICS: du behöver mer drift-/incident-kontext (vilken BugSink-issue, stacktrace, repro) innan du kan svara. Beskriv exakt vad Kent ska ta fram.",
+    "- ESCALATE: det är ett genuint produkt-/UX-/affärsbeslut som en MÄNNISKA måste fatta (varken du eller Kent kan avgöra det). Formulera frågan till människan kort och konkret.",
+    "",
+    "Svara EXAKT i detta format, inget annat:",
+    "<<<ROUTE>>>",
+    `decision: ANSWER | ${diagnostics ? "" : "NEED_DIAGNOSTICS | "}ESCALATE`,
+    "body: <svaret till Eva / vad Kent ska ta fram / frågan till människan>",
+    "<<<END>>>",
+  ].filter((l) => l !== "").join("\n");
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", leo, "--message", prompt]), { timeoutMs: 120_000 });
+    const block = ((r.output || "").match(/<<<ROUTE>>>([\s\S]*?)<<<END>>>/) || [])[1] || "";
+    const decision = (block.match(/decision:\s*(ANSWER|NEED_DIAGNOSTICS|ESCALATE)/i) || [])[1]?.toUpperCase() || "ESCALATE";
+    const body = (block.match(/body:\s*([\s\S]*)$/) || [])[1]?.trim() || question;
+    return { decision, body };
+  } catch (err) {
+    console.warn(`[dispatch] Leo routing failed for ${iss.identifier}: ${String(err)} — defaulting to ESCALATE`);
+    return { decision: "ESCALATE", body: question };
+  }
+}
+
+// Run Kent directly (read-only) to fetch the diagnostics Leo asked for. Redacted.
+async function kentFetchDiagnostics({ iss, ask }) {
+  const agent = process.env.BUGSINK_KENT_AGENT?.trim() || "kent";
+  const prompt = [
+    "Du är Kent, drift-agent. Leo behöver diagnostik för ett Linear-task innan kod-agenten Eva kan fortsätta. Svara kort, konkret, på svenska.",
+    "",
+    `Issue: ${iss.identifier} — ${iss.title}`,
+    String(iss.description || "").slice(0, 2000),
+    "",
+    `Leo ber dig ta fram: ${String(ask || "").slice(0, 800)}`,
+    "",
+    "Svara med vad du faktiskt kan belägga — säg ärligt om något inte framgår. Inkludera ALDRIG PII/e-post/tokens/nycklar/kunddata.",
+    "Svara EXAKT i detta format, inget annat:",
+    "<<<DIAG>>>",
+    "<diagnostiken>",
+    "<<<END>>>",
+  ].join("\n");
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["agent", "--agent", agent, "--message", prompt]), { timeoutMs: 120_000 });
+    const m = (r.output || "").match(/<<<DIAG>>>([\s\S]*?)<<<END>>>/);
+    return m ? redactSensitive(m[1].trim()).slice(0, 2500) : null;
+  } catch (err) { console.warn(`[dispatch] Kent diagnostics failed: ${String(err)}`); return null; }
+}
+
+// Escalate EVA's question to a human in Slack + park the task for later resume.
+async function escalateClarificationToHuman({ iss, sessionKey, question, brief }) {
+  const channel = slackChannelId();
+  const text =
+    `🟠 *Eva blockerad på ${iss.identifier}* — behöver ett mänskligt beslut innan hon kan fortsätta.\n\n` +
+    `*${iss.title}*\n${iss.url}\n\n*Frågan:*\n${String(question).slice(0, 1500)}\n\n` +
+    "_Svara i tråden så fortsätter Eva automatiskt._";
+  let ts = null;
+  // Prefer the issue's existing incident thread root so the conversation stays together.
+  const threads = dispLoad("dispatch-threads.json", {});
+  const existing = Object.values(threads).find((r) => r.issue === iss.identifier);
+  if (channel && existing?.ts) {
+    const r = await slackCall("chat.postMessage", { channel, thread_ts: existing.ts, text });
+    if (r?.ok) ts = existing.ts; // replies live under the incident thread root
+  }
+  if (!ts && channel) {
+    const r = await slackCall("chat.postMessage", { channel, text });
+    if (r?.ok && r.ts) ts = r.ts;
+  }
+  if (!ts) { console.warn(`[dispatch] could not post escalation for ${iss.identifier} to Slack`); return false; }
+  const pending = dispLoad("dispatch-clarifications.json", {});
+  pending[iss.id] = {
+    issueId: iss.id, identifier: iss.identifier, title: iss.title, url: iss.url,
+    description: String(iss.description || "").slice(0, 3000),
+    sessionKey, brief: brief || "", question, channel, ts, postedAt: Date.now(),
+  };
+  dispSave("dispatch-clarifications.json", pending);
+  await linearAddComment(iss.id, `🟠 Eva blockerad på en fråga — Leo eskalerade till Slack och inväntar mänskligt svar:\n\n> ${String(question).slice(0, 800)}`);
+  console.log(`[dispatch] ${iss.identifier}: escalated to human (ts=${ts}), task parked`);
+  return true;
+}
+
+// Run EVA with Leo-routing around her clarifications. Returns one of:
+// { prUrl } | { parked: true } | { lastOut, exitErr } (no PR).
+async function dispatchWorkerWithRouting({ iss, brief, task, helperPath, worker }) {
+  // FRESH session per task — reusing agent:eva:main poisoned every retry.
+  const sessionKey = `agent:${worker}:task-${iss.identifier.toLowerCase()}-${Date.now()}`;
+  let res = await runEvaWorker({ iss, sessionKey, firstMessage: task, helperPath, worker });
+  let round = 0;
+  while (res.clarify && !res.prUrl && dispatchRouterEnabled() && round < MAX_CLARIFY_ROUNDS) {
+    round++;
+    console.log(`[dispatch] ${iss.identifier}: EVA asked a clarification (round ${round}/${MAX_CLARIFY_ROUNDS}) → routing to Leo`);
+    let route = await leoRouteClarification({ iss, brief, question: res.clarify });
+    if (route.decision === "NEED_DIAGNOSTICS") {
+      console.log(`[dispatch] ${iss.identifier}: Leo wants diagnostics → running Kent`);
+      const diag = await kentFetchDiagnostics({ iss, ask: route.body });
+      route = await leoRouteClarification({ iss, brief, question: res.clarify, diagnostics: diag || "(Kent gav ingen diagnostik)" });
+    }
+    if (route.decision === "ESCALATE") {
+      const ok = await escalateClarificationToHuman({ iss, sessionKey, question: route.body || res.clarify, brief });
+      return ok ? { parked: true } : { lastOut: res.lastOut, exitErr: false };
+    }
+    // ANSWER → resume EVA in the SAME session with Leo's decision.
+    await linearAddComment(iss.id, `🔵 Leo besvarade Evas fråga och lät henne fortsätta:\n\n> ${String(route.body).slice(0, 700)}`);
+    const resumeMsg =
+      `Leo (orchestrator) svarar på din fråga: ${route.body}\n\n` +
+      "Fortsätt nu arbetet utifrån det här beslutet, hela vägen till en öppnad PR. Ställ inga fler frågor om det inte är ytterligare ett genuint produktbeslut.";
+    res = await runEvaWorker({ iss, sessionKey, firstMessage: resumeMsg, helperPath, worker });
+  }
+  if (res.clarify && !res.prUrl && dispatchRouterEnabled()) {
+    // Out of clarify rounds — escalate the still-open question rather than loop forever.
+    const ok = await escalateClarificationToHuman({ iss, sessionKey, question: res.clarify, brief });
+    if (ok) return { parked: true };
+  }
+  return { prUrl: res.prUrl, lastOut: res.lastOut, exitErr: res.exitErr };
+}
+
+// Phase 0: resume parked tasks whose human answered in the Slack thread.
+async function resumeAnsweredClarifications({ worker, helperPath }) {
+  const pending = dispLoad("dispatch-clarifications.json", {});
+  if (Object.keys(pending).length === 0) return;
+  const approvers = (process.env.DISPATCH_APPROVERS || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const botId = await slackBotUserId();
+  let changed = false;
+  for (const id of Object.keys(pending)) {
+    const rec = pending[id];
+    if (Date.now() - (rec.postedAt || 0) > 7 * 24 * 3600 * 1000) { delete pending[id]; changed = true; continue; }
+    const cr = await slackCall("conversations.replies", { channel: rec.channel, ts: rec.ts, limit: 50 });
+    if (!cr?.ok) continue;
+    const answer = (cr.messages || []).find((m) =>
+      m.ts !== rec.ts && !m.bot_id && m.user && m.user !== botId &&
+      (approvers.length === 0 || approvers.includes(m.user)) &&
+      String(m.text || "").trim().length > 0,
+    );
+    if (!answer) continue;
+    console.log(`[dispatch] ${rec.identifier}: human answered parked clarification → resuming ${worker}`);
+    // Unpark BEFORE the (long) run so a crash can't loop it forever.
+    delete pending[id]; dispSave("dispatch-clarifications.json", pending); changed = true;
+    await slackCall("chat.postMessage", { channel: rec.channel, thread_ts: rec.ts, text: `🔵 Tack — Eva fortsätter på ${rec.identifier} utifrån ditt svar.` });
+    await linearAddComment(rec.issueId, `🔵 Människa svarade i Slack — Eva återupptar arbetet:\n\n> ${String(answer.text).slice(0, 700)}`);
+    const iss = { id: rec.issueId, identifier: rec.identifier, title: rec.title, url: rec.url, description: rec.description || "" };
+    const resumeMsg =
+      `En människa har svarat på din blockerande fråga: ${answer.text}\n\n` +
+      "Fortsätt nu arbetet utifrån svaret, hela vägen till en öppnad PR.";
+    const res = await runEvaWorker({ iss, sessionKey: rec.sessionKey, firstMessage: resumeMsg, helperPath, worker });
+    if (res.prUrl) await linearAddComment(rec.issueId, `🤖 ${worker} öppnade PR: ${res.prUrl}`);
+    else if (res.clarify) await escalateClarificationToHuman({ iss, sessionKey: rec.sessionKey, question: res.clarify, brief: rec.brief });
+    else if (res.lastOut) await linearAddComment(rec.issueId, `⚠️ ${worker} fortsatte men öppnade ingen PR. Sista utdraget:\n\n> ${redactSensitive(res.lastOut.slice(-500))}`);
+    // Escalation above may have re-added a pending entry — keep it.
+    Object.assign(pending, dispLoad("dispatch-clarifications.json", {}));
+  }
+  if (changed) dispSave("dispatch-clarifications.json", pending);
+}
+
 // ---- Poll Linear: (1) Backlog/Todo → Leo dispatches EVA + issue → In Progress;
 // ---- (2) In Progress issues where EVA's PR exists (GitHub attachment) → In PR review.
 // EVA never merges — humans are the merge gate; Leo owns the status moves.
@@ -2365,6 +2622,13 @@ async function _pollLinearForDispatchInner() {
   const leoId = await linearLeoUserId();
   const leo = process.env.LEO_AGENT?.trim() || "leo";
   const worker = process.env.WORKER_AGENT?.trim() || "eva";
+  const helperPath = path.join(process.cwd(), "src", "github-credential-helper.mjs");
+
+  // ── Phase 0: resume any task parked on a human clarification that got answered ──
+  if (dispatchRouterEnabled()) {
+    try { await resumeAnsweredClarifications({ worker, helperPath }); }
+    catch (err) { console.warn(`[dispatch] resume-clarifications failed: ${String(err)}`); }
+  }
 
   // Issues are "Leo's" if they carry the dispatch label OR are assigned to him.
   const orFilter = leoId
@@ -2419,10 +2683,9 @@ async function _pollLinearForDispatchInner() {
     if (progress) await linearSetState(iss.id, progress.id);
     await linearAddComment(iss.id, `🤖 Leo dispatchade \`${worker}\`: implementera på \`agent/${iss.identifier}-<slug>\`, PR mot \`staging\`. EVA mergar aldrig.`);
 
-    // 2) Wrapper runs EVA directly with the brief (long turn — she implements + opens the PR).
+    // 2) Wrapper runs EVA (with Leo-routing on her clarifications) until a PR.
     //    The prompt states her ACTUAL environment facts explicitly: without them she
     //    assumes "no repo access" and politely declines (observed on her first run).
-    const helperPath = path.join(process.cwd(), "src", "github-credential-helper.mjs");
     const task = [
       `Implementera Linear-issue ${iss.identifier}: ${iss.title}`,
       iss.url,
@@ -2451,80 +2714,28 @@ async function _pollLinearForDispatchInner() {
       "Du får ALDRIG merga och ALDRIG pusha direkt till staging/main/dev — människor är merge-grinden.",
       "Om ett steg failar: visa exakta felet och försök rimliga alternativ innan du ger upp — rapportera aldrig 'saknar åtkomst' utan att ha kört kommandot.",
       "PR-länken du rapporterar VERIFIERAS MASKINELLT mot GitHub-API:t. En påhittad länk upptäcks alltid och räknas som misslyckad körning. Visa rå output från gh pr create.",
+      ...(dispatchRouterEnabled() ? [
+        "",
+        "AUTONOMI vs FRÅGOR: Lös tekniska/implementations-tvetydigheter SJÄLV (vilken fil, vilket mönster, finns hjälpfunktionen — läs koden och bestäm). Fråga ALDRIG om sådant — gissa rimligt och fortsätt.",
+        "BARA om uppgiften är genuint UNDERBESTÄMD så att en gissning skulle slösa hela PR-cykeln (du står mellan två materiellt olika tolkningar och varken brief eller issue avgör vilken) — STANNA i stället för att gissa. Avsluta då turen med EXAKT detta och inget annat:",
+        "<<<CLARIFY>>>",
+        "<din fråga + de två alternativen du står mellan, kort>",
+        "<<<END>>>",
+        "Öppna INGEN PR i det läget. Leo besvarar frågan (eller skickar den till en människa) och du återupptas automatiskt i samma session.",
+      ] : []),
     ].join("\n");
-    const evaTimeoutMs = Number.parseInt(process.env.WORKER_TIMEOUT_MS ?? "1800000", 10) || 1_800_000;
-    const maxTurns = Number.parseInt(process.env.WORKER_MAX_TURNS ?? "4", 10) || 4;
-
-    // Trust nothing: a reported PR link is only accepted after the GitHub API
-    // confirms it exists (her first "success" was a fabricated #1224 in 34s).
-    const mintGithubToken = async () => {
-      try {
-        const r = await runCmd(OPENCLAW_NODE, [helperPath, "--token"], { timeoutMs: 30_000 });
-        const t = (r.output || "").trim().split(/\s+/).pop();
-        return r.code === 0 && t && t.length > 20 ? t : null;
-      } catch { return null; }
-    };
-    const verifyPrExists = async (url) => {
-      const m = String(url).match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-      if (!m) return false;
-      const token = await mintGithubToken();
-      if (!token) { console.warn("[dispatch] could not mint token to verify PR — accepting unverified"); return true; }
-      try {
-        const res = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, {
-          headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "ahody-wrapper" },
-        });
-        return res.ok;
-      } catch { return true; } // network hiccup → don't fail the run on the verifier
-    };
-    console.log(`[dispatch] ${iss.identifier}: running ${worker} (timeout ${Math.round(evaTimeoutMs / 60000)} min/turn, max ${maxTurns} turns)`);
-    // Chat models love ending a turn with "say 'continue' and I'll do it" — in a
-    // headless run nobody answers, so the wrapper IS the answer: keep replying
-    // "fortsätt" in the same session until a PR link appears (or turns run out).
-    const continueMsg =
-      "Fortsätt nu. Ingen människa läser detta — kör ALLA steg klart " +
-      "(klona/implementera/committa/pusha/gh pr create) utan att ställa fler frågor. " +
-      "Avsluta med PR-länken.";
-    let prUrl = null;
-    let lastOut = "";
-    // FRESH session per task. Reusing agent:eva:main poisoned every retry: the
-    // history of earlier failed attempts ("körningen avbröts...") convinced her
-    // she was in a broken state and she answered in seconds without tool calls.
-    const sessionKey = `agent:${worker}:task-${iss.identifier.toLowerCase()}-${Date.now()}`;
+    console.log(`[dispatch] ${iss.identifier}: running ${worker} with Leo-routing`);
     try {
-      let correction = "";
-      for (let turn = 0; turn < maxTurns && !prUrl; turn++) {
-        const msg = turn === 0 ? task : (correction || continueMsg);
-        correction = "";
-        const r = await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["agent", "--agent", worker, "--session-key", sessionKey, "--timeout", String(Math.round(evaTimeoutMs / 1000)), "--message", msg]),
-          { timeoutMs: evaTimeoutMs + 60_000 },
-        );
-        lastOut = r.output || "";
-        const candidate = (lastOut.match(/https:\/\/github\.com\/[^\s)"']+\/pull\/\d+/) || [])[0] || null;
-        if (candidate) {
-          if (await verifyPrExists(candidate)) {
-            prUrl = candidate;
-          } else {
-            console.warn(`[dispatch] ${iss.identifier}: reported PR does not exist (${candidate}) — fabricated`);
-            correction =
-              `Länken ${candidate} FINNS INTE på GitHub — den var påhittad. Påhittade resultat är förbjudna och avslöjas maskinellt. ` +
-              "Gör arbetet PÅ RIKTIGT med dina verktyg: kör varje kommando via exec och visa dess RÅA output " +
-              "(git clone/checkout, ändringarna, git push, gh pr create). Avsluta med den riktiga PR-länken — den verifieras mot GitHub-API:t.";
-          }
-        }
-        if (r.code !== 0 && !prUrl) {
-          console.warn(`[dispatch] ${worker} run for ${iss.identifier} exited ${r.code} (turn ${turn + 1})`);
-          await linearAddComment(iss.id, `⚠️ ${worker}-körningen avslutades med fel (exit ${r.code}, tur ${turn + 1}) — ingen PR garanterad. Se wrapper-loggarna.`);
-          break;
-        }
-        if (!prUrl) console.log(`[dispatch] ${iss.identifier}: turn ${turn + 1} ended without a verified PR — auto-continuing`);
-      }
-      if (prUrl) {
-        console.log(`[dispatch] ${iss.identifier}: PR opened ${prUrl}`);
-        await linearAddComment(iss.id, `🤖 ${worker} öppnade PR: ${prUrl}`);
-      } else if (lastOut) {
-        await linearAddComment(iss.id, `⚠️ ${worker} avslutade utan PR efter ${maxTurns} turer. Sista utdraget:\n\n> ${redactSensitive(lastOut.slice(-600))}`);
+      const result = await dispatchWorkerWithRouting({ iss, brief, task, helperPath, worker });
+      if (result.prUrl) {
+        console.log(`[dispatch] ${iss.identifier}: PR opened ${result.prUrl}`);
+        await linearAddComment(iss.id, `🤖 ${worker} öppnade PR: ${result.prUrl}`);
+      } else if (result.parked) {
+        console.log(`[dispatch] ${iss.identifier}: parked — awaiting human answer in Slack`);
+      } else if (result.exitErr) {
+        await linearAddComment(iss.id, `⚠️ ${worker}-körningen avslutades med fel — ingen PR garanterad. Se wrapper-loggarna.`);
+      } else if (result.lastOut) {
+        await linearAddComment(iss.id, `⚠️ ${worker} avslutade utan PR. Sista utdraget:\n\n> ${redactSensitive(result.lastOut.slice(-600))}`);
       }
     } catch (err) {
       console.warn(`[dispatch] ${worker} run failed for ${iss.identifier}: ${String(err)}`);
